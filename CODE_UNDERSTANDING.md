@@ -232,11 +232,11 @@
 
 ---
 
-## 8. 端到端场景：两入口共享一个模块 + 一次动态 `import()`
+## 7. 端到端场景：两入口共享一个模块 + 一次动态 `import()`
 
 维护团队最常问的问题是：“**源码里写的一条 `import` 到底怎么变成编译图、又怎么变成浏览器里跑的装载代码？**” 本节用一个具体场景把 §1–§5 的机制串成一条线，全程复用三个执行域（build-time / output-runtime / watch-cache）与对象所有权。
 
-### 8.0 场景设定
+### 7.0 场景设定
 
 ```js
 // entryA.js
@@ -251,7 +251,7 @@ import { s } from "./shared";      // 静态：与 A 指向同一个 shared 模�
 
 预告结论：`shared` 会**同时复制进 entryA 与 entryB 两个 chunk**；`lazy` 会拿到**自己的 async chunk**；`import()` 表达式会被翻译成 `__webpack_require__.e(chunkId).then(...)`，而 `.e` / jsonp 装载器由 `RuntimeModule` 生成、打进 runtime chunk。
 
-### 8.1 第一步（build-time）：parser 把三条 import 变成 Dependency / Block
+### 7.1 第一步（build-time）：parser 把三条 import 变成 Dependency / Block
 
 模块 build 阶段（§3.3 的 `_buildModule` → `module.build` → loader/parser）里，`JavascriptParser` 遍历 AST，不同 import 形态触发不同 hook，产出**只存在于构建期**的 `Dependency`/`AsyncDependenciesBlock`，挂在 `Module` 上。存储模型：`Module extends DependenciesBlock`（[Module.js:189](file:///e:/newGsb/questions/GSB-013/Thor/lib/Module.js#L189)），`this.dependencies` / `this.blocks` 数组与 `addDependency` / `addBlock` 都来自基类（[DependenciesBlock.js:32-64](file:///e:/newGsb/questions/GSB-013/Thor/lib/DependenciesBlock.js#L32-L64)）。
 
@@ -273,9 +273,9 @@ import { s } from "./shared";      // 静态：与 A 指向同一个 shared 模�
 
 **`AsyncDependenciesBlock`**（[AsyncDependenciesBlock.js:24-48](file:///e:/newGsb/questions/GSB-013/Thor/lib/AsyncDependenciesBlock.js#L24-L48)）`extends DependenciesBlock`，构造签名 `(groupOptions, loc, request)`；`groupOptions.name` 即 `chunkName`（可来自 `/* webpackChunkName */`）。**它就是“分割点”**：一个 block 后续对应一个 ChunkGroup。
 
-> 域归属：`Dependency`、`AsyncDependenciesBlock` 全部是 **build-time-only**，挂在 `Module` 上，随 `Compilation` 生灭。它们经 `makeSerializable` 可进**持久化缓存**（watch/cache 域），但**绝不进 emitted runtime**——最终产物里只有它们的 `.Template` 生成的源码字符串（§8.4）。
+> 域归属：`Dependency`、`AsyncDependenciesBlock` 全部是 **build-time-only**，挂在 `Module` 上，随 `Compilation` 生灭。它们经 `makeSerializable` 可进**持久化缓存**（watch/cache 域），但**绝不进 emitted runtime**——最终产物里只有它们的 `.Template` 生成的源码字符串（§7.4）。
 
-### 8.2 第二步（build-time）：ModuleGraph 记录“谁依赖谁”
+### 7.2 第二步（build-time）：ModuleGraph 记录“谁依赖谁”
 
 `make` 递归（§3.3 的 `handleModuleCreation` → `_processModuleDependencies`）对每条依赖调 `moduleGraph.setResolvedModule` / `setParents`，把上面的 Dependency 解析成指向具体 `Module` 的边。结果：
 
@@ -284,7 +284,7 @@ import { s } from "./shared";      // 静态：与 A 指向同一个 shared 模�
 
 此刻（make/finish 之后、seal 之前，见 §3.4）`ModuleGraph` 完整；`ChunkGraph` 仍是 `undefined`。**ModuleGraph 只关心模块与依赖，不关心 chunk**。
 
-### 8.3 第三步（build-time）：`buildChunkGraph` 把模块铺进 chunk
+### 7.3 第三步（build-time）：`buildChunkGraph` 把模块铺进 chunk
 
 seal 阶段先按 entries 造出 entryA-chunk、entryB-chunk 两个入口 chunk + `Entrypoint`，塞进 `chunkGraphInit`（§3.5），再调 `buildChunkGraph(this, chunkGraphInit)`（[Compilation.js:3227](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L3227)）。算法（[buildChunkGraph.js:1301](file:///e:/newGsb/questions/GSB-013/Thor/lib/buildChunkGraph.js#L1301)）三阶段：`visitModules`（[:247](file:///e:/newGsb/questions/GSB-013/Thor/lib/buildChunkGraph.js#L247)）→ `connectChunkGroups`（[:1216](file:///e:/newGsb/questions/GSB-013/Thor/lib/buildChunkGraph.js#L1216)）→ `cleanupUnconnectedGroups`（[:1280](file:///e:/newGsb/questions/GSB-013/Thor/lib/buildChunkGraph.js#L1280)）。
 
@@ -296,16 +296,16 @@ seal 阶段先按 entries 造出 entryA-chunk、entryB-chunk 两个入口 chunk 
 
 **`ChunkGraph` 允许一个 Module 属于多个 Chunk**：每模块记录 `ChunkGraphModule.chunks = new SortableSet()`（[ChunkGraph.js:201-202](file:///e:/newGsb/questions/GSB-013/Thor/lib/ChunkGraph.js#L201-L202)），`connectChunkAndModule` 同时往 `cgm.chunks` 和 `cgc.modules` 各加一次（[:343-348](file:///e:/newGsb/questions/GSB-013/Thor/lib/ChunkGraph.js#L343-L348)）。这就是 `shared` 能同时在两个 chunk 的数据结构基础。`ChunkGraph` 用 `WeakMap` 挂在 live 对象上（[:255-260](file:///e:/newGsb/questions/GSB-013/Thor/lib/ChunkGraph.js#L255-L260)），**build-time-only，不序列化进产物**。
 
-### 8.4 第四步（build-time → 翻译进 runtime）：code generation
+### 7.4 第四步（build-time → 翻译进 runtime）：code generation
 
 seal 的代码生成阶段（§3.5 第 7 步）对每个模块调 `module.codeGeneration(...)`，Dependency 的 `.Template` 负责把源码里的 import 表达式替换成 `__webpack_require__` 调用，**同时**往该模块的 `runtimeRequirements`（一个 `Set<string>`）里登记需要的 `RuntimeGlobals`：
 
 - **静态 import** → `HarmonyImportDependency.Template`（[HarmonyImportDependency.js:279](file:///e:/newGsb/questions/GSB-013/Thor/lib/dependencies/HarmonyImportDependency.js#L279)）经 `RuntimeTemplate.importStatement` 生成 `__webpack_require__(moduleId)`，并 `runtimeRequirements.add(RuntimeGlobals.require)`（[RuntimeTemplate.js:842-843](file:///e:/newGsb/questions/GSB-013/Thor/lib/RuntimeTemplate.js#L842-L843)）。**只要 require，不涉及 chunk 装载**。
-- **动态 import** → `ImportDependency.Template.apply`（[ImportDependency.js:116](file:///e:/newGsb/questions/GSB-013/Thor/lib/dependencies/ImportDependency.js#L116)）经 `moduleNamespacePromise` → `blockPromise` 生成 `__webpack_require__.e(chunkId).then(__webpack_require__.bind(__webpack_require__, moduleId))`，并 `add(RuntimeGlobals.ensureChunk)`（[RuntimeTemplate.js:1009](file:///e:/newGsb/questions/GSB-013/Thor/lib/RuntimeTemplate.js#L1009)）+ `add(RuntimeGlobals.require)`（[:690-691](file:///e:/newGsb/questions/GSB-013/Thor/lib/RuntimeTemplate.js#L690-L691)）。`chunkId` 正是 §8.3 里为 `lazy` 新建的那个 async chunk 的 id（Template 靠 `getParentBlock(dep)` → chunkGroup 找到它）。
+- **动态 import** → `ImportDependency.Template.apply`（[ImportDependency.js:116](file:///e:/newGsb/questions/GSB-013/Thor/lib/dependencies/ImportDependency.js#L116)）经 `moduleNamespacePromise` → `blockPromise` 生成 `__webpack_require__.e(chunkId).then(__webpack_require__.bind(__webpack_require__, moduleId))`，并 `add(RuntimeGlobals.ensureChunk)`（[RuntimeTemplate.js:1009](file:///e:/newGsb/questions/GSB-013/Thor/lib/RuntimeTemplate.js#L1009)）+ `add(RuntimeGlobals.require)`（[:690-691](file:///e:/newGsb/questions/GSB-013/Thor/lib/RuntimeTemplate.js#L690-L691)）。`chunkId` 正是 §7.3 里为 `lazy` 新建的那个 async chunk 的 id（Template 靠 `getParentBlock(dep)` → chunkGroup 找到它）。
 
 `RuntimeGlobals` 只是字符串常量：`require = "__webpack_require__"`、`ensureChunk = "__webpack_require__.e"`、`ensureChunkHandlers = "__webpack_require__.f"`（[RuntimeGlobals.js:76-81](file:///e:/newGsb/questions/GSB-013/Thor/lib/RuntimeGlobals.js#L76-L81)）。**runtimeRequirements 是构建期元数据，不是代码**——它记录“这段产物需要哪些运行时能力”，下一步才被翻译成真实运行时代码。
 
-### 8.5 第五步（build-time 决策 → output-runtime 落地）：runtime requirements 展开成 `RuntimeModule`
+### 7.5 第五步（build-time 决策 → output-runtime 落地）：runtime requirements 展开成 `RuntimeModule`
 
 `processRuntimeRequirements`（[Compilation.js:3708](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L3708)，seal 中 [:3328](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L3328) 调用）把各模块的 `Set<string>` 沿 module→chunk→tree 汇聚，然后对每个 requirement 通过 `runtimeRequirementInTree.for(r).call(...)`（[:3824-3828](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L3824-L3828)）扇出给插件，插件据此**追加 requirement 并注入 `RuntimeModule`**：
 
@@ -317,7 +317,7 @@ seal 的代码生成阶段（§3.5 第 7 步）对每个模块调 `module.codeGe
 - `EnsureChunkRuntimeModule.generate`（[EnsureChunkRuntimeModule.js:26](file:///e:/newGsb/questions/GSB-013/Thor/lib/runtime/EnsureChunkRuntimeModule.js#L26)）：定义 `__webpack_require__.f = {}` 与 `__webpack_require__.e = chunkId => Promise.all(Object.keys(f).reduce(...))`——即 `.e` 遍历所有已注册的 `.f` 处理器。
 - `JsonpChunkLoadingRuntimeModule.generate`（[JsonpChunkLoadingRuntimeModule.js:75](file:///e:/newGsb/questions/GSB-013/Thor/lib/web/JsonpChunkLoadingRuntimeModule.js#L75)）：把 `__webpack_require__.f.j = (chunkId, promises) => {...}` 注册进 `.f`（[:147](file:///e:/newGsb/questions/GSB-013/Thor/lib/web/JsonpChunkLoadingRuntimeModule.js#L147)），内部用 `loadScript` 插入 `<script>` 拉取 `lazy` chunk 文件，并挂 `webpackJsonpCallback` 在 chunk 到达时 resolve 那个 Promise。
 
-### 8.6 一图流：从一条 import 到浏览器装载
+### 7.6 一图流：从一条 import 到浏览器装载
 
 | 源码 | build-time 产物 | 图/所有权 | 翻译进 runtime 的部分 | 域 |
 | --- | --- | --- | --- | --- |
@@ -331,7 +331,7 @@ seal 的代码生成阶段（§3.5 第 7 步）对每个模块调 `module.codeGe
 
 ---
 
-## 10. watch 模式失效与缓存复用：排查“改了没生效 / 没改却重做”
+## 8. watch 模式失效与缓存复用：排查“改了没生效 / 没改却重做”
 
 本节沿用三域（build-time / output-runtime / watch-cache）与对象所有权，专门支撑两类线上问题的排查：
 - **A. 文件改了却复用旧结果**（stale reuse）——本该重建/重解析的模块被判为“可复用”。
@@ -339,7 +339,7 @@ seal 的代码生成阶段（§3.5 第 7 步）对每个模块调 `module.codeGe
 
 两类问题的判定权分散在三个层次：`Watching`（要不要开新一轮、这轮认为哪些文件变了）→ `NormalModule.needBuild` + `FileSystemInfo` snapshot（单模块要不要重建）→ `PackFileCacheStrategy` + build/resolve snapshot（持久化缓存整体是否作废）。**弄错在哪一层，就会误判 A 还是 B。**
 
-### 10.1 `Watching` 收到 invalidation：汇总变更 → 暂停 watcher → 开新 compile
+### 8.1 `Watching` 收到 invalidation：汇总变更 → 暂停 watcher → 开新 compile
 
 文件监听回调进入 [Watching.js](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js)：
 
@@ -347,42 +347,42 @@ seal 的代码生成阶段（§3.5 第 7 步）对每个模块调 `module.codeGe
 2. **运行中再次 invalid 的合并（关联问题 B/A）**：若 `this.running`，`_invalidate` **只**把变更并入 collected 并置 `this.invalid = true`（[:431-433](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L431-L433)），**不**立刻开新构建；被推迟到下一轮。若 `suspended`/`blocked`，只合并不置位（[:426-429](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L426-L429)）。
 3. **`_go` 开一轮**（[:109-239](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L109-L239)）：
    - **暂停 watcher**：`pausedWatcher = watcher`、`watcher.pause()`、`watcher = null`、记 `lastWatcherStartTime`（[:113-120](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L113-L120)）。
-   - **设 `compiler.fsStartTime = Date.now()`**（[:121](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L121)）——这是本轮的“读盘起点”，后面 snapshot 校验的关键时间基准（§10.3）。
+   - **设 `compiler.fsStartTime = Date.now()`**（[:121](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L121)）——这是本轮的“读盘起点”，后面 snapshot 校验的关键时间基准（§8.3）。
    - **取时间信息**：优先用回调 params，其次 `pausedWatcher.getInfo()`，再退化到 `getAggregatedChanges()`（[:122-153](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L122-L153)）。
    - **把变更交给 compiler 并清空 collected**：`compiler.modifiedFiles = _collectedChangedFiles`（[:155](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L155)）/ `compiler.removedFiles = _collectedRemovedFiles`（[:157](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L157)），随即置 `undefined`（[:156-158](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L156-L158)）。**consume-and-clear**：此后到达的变更只能靠步骤 2 的 running 合并进入下一轮。
-   - **进新 compile**：若 idle 先 `cache.endIdle`（[:161-167](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L161-L167)）→ `readRecords`（[:168-175](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L168-L175)）→ 复位 `invalid=false`（[:176](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L176)）→ `compiler.hooks.watchRun.callAsync`（[:178](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L178)）→ **`compiler.compile(onCompiled)`**（[:234](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L234)）。**每轮都是全新的 `Compilation`**（§3.2），旧 `Compilation` 的图/资产不跨轮携带——跨轮复用只能来自 `Cache`（§10.4）。
+   - **进新 compile**：若 idle 先 `cache.endIdle`（[:161-167](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L161-L167)）→ `readRecords`（[:168-175](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L168-L175)）→ 复位 `invalid=false`（[:176](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L176)）→ `compiler.hooks.watchRun.callAsync`（[:178](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L178)）→ **`compiler.compile(onCompiled)`**（[:234](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L234)）。**每轮都是全新的 `Compilation`**（§3.2），旧 `Compilation` 的图/资产不跨轮携带——跨轮复用只能来自 `Cache`（§8.4）。
 
-### 10.2 `_done`：收尾、按 compilation 依赖重挂 watcher、再失效分支
+### 8.2 `_done`：收尾、按 compilation 依赖重挂 watcher、再失效分支
 
 `_done`（[Watching.js:255-346](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L255-L346)）：
 
 - **再失效分支（不进 idle 直接开下一轮）**：若 `this.invalid`（构建期间有新变更）且未 suspended/blocked，`storeBuildDependencies` 后直接 `_go()`（[:281-298](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L281-L298)）——这里消费上一轮 running 合并进 collected 的变更。
 - **正常收尾**：建 `Stats`（[:303-307](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L303-L307)）→ `done` hook（[:314](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L314)）→ `cache.storeBuildDependencies(compilation.buildDependencies, ...)`（[:318-321](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L318-L321)）→ **`cache.beginIdle()` + `compiler.idle = true`**（[:326-327](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L326-L327)）。
-- **重挂 watcher**：`process.nextTick` 里 `this.watch(compilation.fileDependencies, compilation.contextDependencies, compilation.missingDependencies)`（[:329-340](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L329-L340)）。**下一轮监听哪些路径，完全由上一轮 `Compilation` 汇总出的三组依赖决定**（§10.3 第 4 点）。若某依赖没被登记，改它就不会触发 invalidation → 表现为问题 A。
+- **重挂 watcher**：`process.nextTick` 里 `this.watch(compilation.fileDependencies, compilation.contextDependencies, compilation.missingDependencies)`（[:329-340](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L329-L340)）。**下一轮监听哪些路径，完全由上一轮 `Compilation` 汇总出的三组依赖决定**（§8.3 第 4 点）。若某依赖没被登记，改它就不会触发 invalidation → 表现为问题 A。
 
 失效发生的三条边界（本节主题）：
 - **编译图边界**：`compiler.modifiedFiles/removedFiles`（[:155-157](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L155-L157)）影响 `FileSystemInfo` 的“已知变更”，进而决定 `needBuild` 重建哪些模块 → 决定 ModuleGraph 哪些节点重解析。
-- **代码生成结果边界**：模块即便不重建，其 code generation 结果是否复用由 `_codeGenerationCache` 的 etag 决定（§10.4）。
+- **代码生成结果边界**：模块即便不重建，其 code generation 结果是否复用由 `_codeGenerationCache` 的 etag 决定（§8.4）。
 - **写出资产边界**：即便重新生成了 assets，`Compiler.emitAssets` 仍可能因 `compareBeforeEmit`/immutable 跳过实际写盘（见 §4）——“重新生成”≠“重新写盘”。
 
-### 10.3 `FileSystemInfo` snapshot 与四类依赖：单模块复用的判据
+### 8.3 `FileSystemInfo` snapshot 与四类依赖：单模块复用的判据
 
 **snapshot 保存什么事实**（[FileSystemInfo.js](file:///e:/newGsb/questions/GSB-013/Thor/lib/FileSystemInfo.js) `class Snapshot` [:271-306](file:///e:/newGsb/questions/GSB-013/Thor/lib/FileSystemInfo.js#L271-L306)）：文件/目录的 timestamp、hash 或两者（`snapshot.<type>` 的 mode，[:2203](file:///e:/newGsb/questions/GSB-013/Thor/lib/FileSystemInfo.js#L2203)）、**missing 文件的“当时不存在”事实**（`missingExistence`，[:295](file:///e:/newGsb/questions/GSB-013/Thor/lib/FileSystemInfo.js#L295)）、managed/immutable 路径信息（[:297-303](file:///e:/newGsb/questions/GSB-013/Thor/lib/FileSystemInfo.js#L297-L303)）。
 
 1. **创建**：`createSnapshot(startTime, files, directories, missing, options, callback)`（[:2170](file:///e:/newGsb/questions/GSB-013/Thor/lib/FileSystemInfo.js#L2170)），`startTime` 由构建期传入。`checkManaged`（[:2265-2306](file:///e:/newGsb/questions/GSB-013/Thor/lib/FileSystemInfo.js#L2265-L2306)）把 managed/immutable 路径归入“假定不变”集合，正常校验时跳过——**若把频繁变化的路径误判进 managedPaths，会造成问题 A**。
 2. **校验**：`checkSnapshotValid(snapshot, callback)`（[:2729](file:///e:/newGsb/questions/GSB-013/Thor/lib/FileSystemInfo.js#L2729)）先查 `_snapshotCache`（同一 `FileSystemInfo` 内 memoize，[:2730-2739](file:///e:/newGsb/questions/GSB-013/Thor/lib/FileSystemInfo.js#L2730-L2739)），否则走 `_checkSnapshotValidNoCache`（[:2750](file:///e:/newGsb/questions/GSB-013/Thor/lib/FileSystemInfo.js#L2750)）。核心时间规则在 `checkFile`：**`if (typeof startTime === "number" && c.safeTime > startTime) return false;`**（[:2829](file:///e:/newGsb/questions/GSB-013/Thor/lib/FileSystemInfo.js#L2829)，目录版 [:2871](file:///e:/newGsb/questions/GSB-013/Thor/lib/FileSystemInfo.js#L2871)）——文件 `safeTime` 晚于 `startTime` 就判失效。`missingExistence` 的新建/删除通过 `checkExistence`（[:2803](file:///e:/newGsb/questions/GSB-013/Thor/lib/FileSystemInfo.js#L2803)）捕获。
-3. **startTime = `compiler.fsStartTime`**：`NormalModule.build` 用 `const startTime = compilation.compiler.fsStartTime || Date.now()`（[NormalModule.js:1198](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1198)）给本模块 snapshot 打时间戳；而 `fsStartTime` 正是 §10.1 `_go` 在读盘前设的（[Watching.js:121](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L121)）。**这条“读盘起点”是防止“构建途中被改的文件被当作已消化”的护栏**——构建期间（`safeTime > startTime`）改动的文件一律判失效，强制下一轮重建。
+3. **startTime = `compiler.fsStartTime`**：`NormalModule.build` 用 `const startTime = compilation.compiler.fsStartTime || Date.now()`（[NormalModule.js:1198](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1198)）给本模块 snapshot 打时间戳；而 `fsStartTime` 正是 §8.1 `_go` 在读盘前设的（[Watching.js:121](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L121)）。**这条“读盘起点”是防止“构建途中被改的文件被当作已消化”的护栏**——构建期间（`safeTime > startTime`）改动的文件一律判失效，强制下一轮重建。
 4. **`needBuild` 决策阶梯**（[NormalModule.js:1540-1591](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1540-L1591)）：`_forceBuild`（[:1543](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1543)，由 `invalidateBuild()` [:1531-1533](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1531-L1533) 置位）→ `this.error` 重试 → `!cacheable`（[:1552](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1552)）→ `!snapshot`（[:1555](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1555)）→ `valueDependencies` 与 `valueCacheVersions` 比对（DefinePlugin 值变化，[:1558-1573](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1558-L1573)）→ **`fileSystemInfo.checkSnapshotValid(snapshot, ...)`**（[:1576](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1576)），失效即 `callback(null, true)` 重建。`build()` 末尾 `createSnapshot(...)` 存入 `buildInfo.snapshot`（[:1315-1329](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1315-L1329)）。`Compilation._buildModule` 正是在 build 前调 `module.needBuild(...)`（[Compilation.js:1500](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L1500)），返回 false 则跳过、触发 `stillValidModule`。
 5. **loader 额外登记的依赖**：loader 通过 `loaderContext.addDependency/addContextDependency/addMissingDependency`（由 loader-runner 实现，回填到 `result.fileDependencies` 等），在 `NormalModule.build` 里 `fileDependencies.addAll(result.fileDependencies)`（[NormalModule.js:1073-1075](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1073-L1075)）并进入该模块 snapshot；loader 本身路径与 `addBuildDependency`（[:810-817](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L810-L817)）进 `buildInfo.buildDependencies`。**loader 忘记 `addDependency` 是问题 A 的经典根因**：读了某文件却没登记，snapshot 不含它，改它不触发重建。
-6. **四类依赖聚合与去向**：`Compilation` 构造四个 `LazySet`：`fileDependencies`/`contextDependencies`/`missingDependencies`/`buildDependencies`（[Compilation.js:1183-1189](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L1183-L1189)）。`summarizeDependencies()`（[:4203](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L4203)，seal 中 [:3384](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L3384) 调用）合并子编译并对每模块 `addCacheDependencies`。前三者 → §10.2 重挂 watcher；`buildDependencies` → §10.4 持久化缓存整体校验。
+6. **四类依赖聚合与去向**：`Compilation` 构造四个 `LazySet`：`fileDependencies`/`contextDependencies`/`missingDependencies`/`buildDependencies`（[Compilation.js:1183-1189](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L1183-L1189)）。`summarizeDependencies()`（[:4203](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L4203)，seal 中 [:3384](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L3384) 调用）合并子编译并对每模块 `addCacheDependencies`。前三者 → §8.2 重挂 watcher；`buildDependencies` → §8.4 持久化缓存整体校验。
 
-### 10.4 `CacheFacade` identifier/etag 与 `PackFileCacheStrategy`：持久化缓存整体复用
+### 8.4 `CacheFacade` identifier/etag 与 `PackFileCacheStrategy`：持久化缓存整体复用
 
 **CacheFacade 的 identifier/etag 模型**（[CacheFacade.js](file:///e:/newGsb/questions/GSB-013/Thor/lib/CacheFacade.js)）：identifier 是带 name 前缀的字符串（`getItemCache` 拼 `${this._name}|${identifier}`，[:225-231](file:///e:/newGsb/questions/GSB-013/Thor/lib/CacheFacade.js#L225-L231)）；etag 由 `getLazyHashedEtag(obj)`（[:237-239](file:///e:/newGsb/questions/GSB-013/Thor/lib/CacheFacade.js#L237-L239)，其 `toString()` 惰性算 `obj.updateHash` 的 hash）或 `mergeEtags`（[:246-248](file:///e:/newGsb/questions/GSB-013/Thor/lib/CacheFacade.js#L246-L248)，`"a|b"`）产生；`provide/providePromise`（[:318-345](file:///e:/newGsb/questions/GSB-013/Thor/lib/CacheFacade.js#L318-L345)）= get-else-compute-then-store。
 
 具体用法在 `Compilation`：模块缓存 `_modulesCache = getCache("Compilation/modules")`（[Compilation.js:1203](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L1203)）用 **etag=null**，靠 snapshot 判有效（[:1433](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L1433)/[:1536](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L1536)）；**代码生成缓存**用真 etag：`_codeGenerationModule` 以 identifier `${module.identifier()}|${runtimeKey}`、etag `${hash}|${dependencyTemplates.getHash()}`（[:3639-3640](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L3639-L3640)）。**结论：watch 下复用一个模块的产物，需要同时满足 (a) snapshot 仍有效（不重建）与 (b) codegen etag 不变（不重生成）**。
 
-**IdleFileCachePlugin**（[IdleFileCachePlugin.js](file:///e:/newGsb/questions/GSB-013/Thor/lib/cache/IdleFileCachePlugin.js)）在 `STAGE_DISK` tap `cache.hooks.store`（不立刻写，入 `pendingIdleTasks` 队列，[:58-65](file:///e:/newGsb/questions/GSB-013/Thor/lib/cache/IdleFileCachePlugin.js#L58-L65)）、`get`（先跑挂起的同 id store 再 `strategy.restore`，[:67-92](file:///e:/newGsb/questions/GSB-013/Thor/lib/cache/IdleFileCachePlugin.js#L67-L92)）、`beginIdle`（起定时器，[:178-218](file:///e:/newGsb/questions/GSB-013/Thor/lib/cache/IdleFileCachePlugin.js#L178-L218)）、`processIdleTasks`（空闲时把 pack 落盘，`strategy.afterAllStored()`，[:137-175](file:///e:/newGsb/questions/GSB-013/Thor/lib/cache/IdleFileCachePlugin.js#L137-L175)）。**因此 `cache.beginIdle()`（§10.2 收尾）才是持久化真正落盘的触发点**——进程若在 idle 前退出，缓存可能未写全。
+**IdleFileCachePlugin**（[IdleFileCachePlugin.js](file:///e:/newGsb/questions/GSB-013/Thor/lib/cache/IdleFileCachePlugin.js)）在 `STAGE_DISK` tap `cache.hooks.store`（不立刻写，入 `pendingIdleTasks` 队列，[:58-65](file:///e:/newGsb/questions/GSB-013/Thor/lib/cache/IdleFileCachePlugin.js#L58-L65)）、`get`（先跑挂起的同 id store 再 `strategy.restore`，[:67-92](file:///e:/newGsb/questions/GSB-013/Thor/lib/cache/IdleFileCachePlugin.js#L67-L92)）、`beginIdle`（起定时器，[:178-218](file:///e:/newGsb/questions/GSB-013/Thor/lib/cache/IdleFileCachePlugin.js#L178-L218)）、`processIdleTasks`（空闲时把 pack 落盘，`strategy.afterAllStored()`，[:137-175](file:///e:/newGsb/questions/GSB-013/Thor/lib/cache/IdleFileCachePlugin.js#L137-L175)）。**因此 `cache.beginIdle()`（§8.2 收尾）才是持久化真正落盘的触发点**——进程若在 idle 前退出，缓存可能未写全。
 
 **PackFileCacheStrategy**（[PackFileCacheStrategy.js](file:///e:/newGsb/questions/GSB-013/Thor/lib/cache/PackFileCacheStrategy.js)）：
 - 构造持有 `fileSystemInfo`、`version`（salt，[:1109](file:///e:/newGsb/questions/GSB-013/Thor/lib/cache/PackFileCacheStrategy.js#L1109)）、`buildDependencies`/`newBuildDependencies`、`buildSnapshot`/`resolveBuildDependenciesSnapshot`/`resolveResults`（[:1080-1136](file:///e:/newGsb/questions/GSB-013/Thor/lib/cache/PackFileCacheStrategy.js#L1080-L1136)）。
@@ -392,7 +392,7 @@ seal 的代码生成阶段（§3.5 第 7 步）对每个模块调 `module.codeGe
 
 **build dependencies vs file/context/missing dependencies 的区别**：前者描述“**如何构建**”（loader 模块、config、webpack 自身），由 `resolveBuildDependencies` 单独解析、用独立快照校验，**一旦变化作废整个持久化缓存**（问题 B 的合理来源）；后者描述“**构建的输入**”，进单模块 snapshot，只影响该模块是否重建。`version` salt 变化（webpack 版本/配置指纹，构造于本文件上游，**未证实**其精确组成）同样整体作废——这是升级 webpack 或改配置后“整轮重做”的正常表现。
 
-### 10.5 判定表：可安全复用 / 必须重建或重解析 / 只需重新生成或写出
+### 8.5 判定表：可安全复用 / 必须重建或重解析 / 只需重新生成或写出
 
 > 说明：以下按“单模块”视角给出主判据与源码依据。“重解析”指重跑 loader+parser 从而可能改变 ModuleGraph 的出边；“重生成”指模块不重建但 code generation 结果因 etag 变化而重算；“重写盘”指 assets 变化后 `emitAssets` 实际写出。
 
@@ -413,19 +413,19 @@ seal 的代码生成阶段（§3.5 第 7 步）对每个模块调 `module.codeGe
 
 ---
 
-## 11. 模块被构建之前：factorize / resolve / createModule → loader-runner / parser / generator
+## 9. 模块被构建之前：factorize / resolve / createModule → loader-runner / parser / generator
 
 线上问题常出在“rule 匹配、resolve、loader 三者之间”——模块还没真正 build 出来的那一段。本节补上 §3.3 `handleModuleCreation` 里 `factorizeModule` 之后、`_buildModule` 之前的全过程，仍沿用三域与对象所有权。
 
 > 版本注记：`NormalModuleFactory` 在本版本**不使用 AsyncQueue**（构造函数导入只有 tapable，[NormalModuleFactory.js:10-16](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L10-L16)），factorize/resolve 全靠 hook `callAsync` 串联（与 §3.3 里 `Compilation` 侧的 `factorizeQueue` 是两回事——队列在 Compilation，工厂本身不排队）。`NormalModule` 用**单个 `createData` 对象**构造，非位置参数。
 
-### 11.1 `NormalModuleFactory` 的 hooks 与 `create` 流水线
+### 9.1 `NormalModuleFactory` 的 hooks 与 `create` 流水线
 
 工厂 hooks（构造函数 [NormalModuleFactory.js:274-311](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L274-L311)）：`resolve`（AsyncSeriesBailHook，[:276](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L276)）、`resolveForScheme`/`resolveInScheme`（HookMap，[:278-284](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L278-L284)）、`factorize`（[:286](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L286)）、`beforeResolve`（[:288](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L288)）、`afterResolve`（[:290](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L290)）、`createModule`（[:292](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L292)）、`module`（SyncWaterfallHook，[:294](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L294)）、`createParser`/`parser`/`createGenerator`/`generator`（HookMap，[:296-306](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L296-L306)）。构造时还编译 `this.ruleSet = ruleSetCompiler.compile([...defaultRules, ...rules])`（[:313-320](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L313-L320)）与 `parserCache`/`generatorCache`（[:326-328](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L326-L328)）。
 
 `create(data, callback)`（[:869-953](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L869-L953)）：建 `resolveData`（含 `createData:{}`、`cacheable:true`，[:882-895](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L882-L895)）→ `beforeResolve.callAsync`（[:896](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L896)，返回 `false` 则产出 ignored 模块）→ `factorize.callAsync`（[:931](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L931)）→ 包成 `ModuleFactoryResult`（[:941-950](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L941-L950)）。这条链由 §3.3 的 `Compilation.factorizeQueue` 触发（`_factorizeModule` → `factory.create`）。
 
-### 11.2 request 与 resource 如何确定（inline loader / matchResource / rule 匹配）
+### 9.2 request 与 resource 如何确定（inline loader / matchResource / rule 匹配）
 
 默认 `resolve` tap（[:419-853](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L419-L853)）是最容易踩坑的地方：
 
@@ -434,50 +434,50 @@ seal 的代码生成阶段（§3.5 第 7 步）对每个模块调 `module.codeGe
 3. **切分 request**：去前缀后按 `/!+/` split，最后一段 pop 成 `unresolvedResource`（**resource**），其余是 inline loader 元素（[:489-505](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L489-L505)）。
 4. **解析 loaders 与 resource**：loader 用 `getResolver("loader")`（[:437](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L437)），inline loaders 经 `resolveRequestArray`（[:749-760](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L749-L760)）解析；resource 走 `defaultResolve` → normal resolver + `resolveResource`（[:765-811](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L765-L811)），得 `resourceData`。scheme（`data:`/`http:` 等）走 `resolveForScheme`/`resolveInScheme`（[:814-848](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L814-L848)），此时不做 inline 解析。
 5. **rule 匹配**：`this.ruleSet.exec({ resource, realResource, resourceQuery, issuer, compiler, issuerLayer, ... })`（[:593-610](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L593-L610)）。结果按 effect 类型分桶：`use`→`useLoaders`、`use-post`→`useLoadersPost`、`use-pre`→`useLoadersPre`（[:611-628](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L611-L628)），其余 effect（如 `type`、parser/generator options）经 `cachedCleverMerge` 并入 `settings`（[:629-644](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L629-L644)）。上面三个 no*AutoLoaders 标志在此 gate 掉相应桶。
-6. **组装最终 loader 顺序**（`continueCallback`，[:655-713](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L655-L713)）：`allLoaders` = `postLoaders` → （无 matchResource 时）inline `loaders` + `normalLoaders`（[:661-664](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L661-L664)）／（有 matchResource 时）`normalLoaders` + inline `loaders`（[:666-669](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L666-L669)）→ `preLoaders`（[:671-672](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L671-L672)）。数组顺序是 **post → normal/inline → pre**；配合 loader-runner 的“normal 阶段反向执行”（§11.4），**实际 normal 执行顺序变成 pre → normal → inline → post**。`userRequest` 字符串在 [:562-569](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L562-L569) 拼出（含 `matchResource!=!` 前缀）。
+6. **组装最终 loader 顺序**（`continueCallback`，[:655-713](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L655-L713)）：`allLoaders` = `postLoaders` → （无 matchResource 时）inline `loaders` + `normalLoaders`（[:661-664](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L661-L664)）／（有 matchResource 时）`normalLoaders` + inline `loaders`（[:666-669](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L666-L669)）→ `preLoaders`（[:671-672](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L671-L672)）。数组顺序是 **post → normal/inline → pre**；配合 loader-runner 的“normal 阶段反向执行”（§9.4），**实际 normal 执行顺序变成 pre → normal → inline → post**。`userRequest` 字符串在 [:562-569](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L562-L569) 拼出（含 `matchResource!=!` 前缀）。
 
 > 排查提示：`request`（含 loader 串）、`userRequest`（人类可读、含 matchResource）、`rawRequest`（原始）、`resource`（真正读盘的文件+query+fragment）是四个不同字段，rule/resolve 类 bug 常是把它们搞混。
 
-### 11.3 createModule：构造 `NormalModule`，parser/generator 获取
+### 9.3 createModule：构造 `NormalModule`，parser/generator 获取
 
 默认 `factorize` tap（[:340-418](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L340-L418)）在 `resolve` 完成后：`resolve` 返回 `false`→ignored、返回 `Module`→直接用（[:350-361](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L350-L361)）→ `afterResolve.callAsync`（[:363](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L363)）→ `createModule.callAsync(createData, resolveData, ...)`（[:379](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L379)）。若无插件产出模块：先试 `createModuleClass.for(settings.type)`（[:389-394](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L389-L394)），再 `new NormalModule(createData)`（[:397-403](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L397-L403)）。最后 `module` SyncWaterfallHook 可**替换/装饰**模块（返回值即最终模块，[:406-410](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L406-L410)）。
 
 `createData` 字段（request/userRequest/rawRequest/loaders/resource/matchResource/settings/type/parser/parserOptions/generator/generatorOptions/resolveOptions/layer）在 [:684-708](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L684-L708) 用 `Object.assign` 填好。其中 **parser/generator 实例**来自按 type 二级缓存的 `getParser(type, settings.parser)` / `getGenerator(type, settings.generator)`（[:703-706](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L703-L706)）：`getParser`（[:1245-1261](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L1245-L1261)）miss 时 `createParser` 触发 `createParser.for(type)` + `parser.for(type)` hook（[:1268-1280](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L1268-L1280)）；generator 同构（[:1287-1324](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L1287-L1324)）。**同 type + 同 options 的 parser/generator 被复用**——这是 build-time 对象，随工厂（每轮编译新建，§3.2）生灭。
 
-### 11.4 `NormalModule.build`：调 loader-runner、parser，产出 dependencies
+### 9.4 `NormalModule.build`：调 loader-runner、parser，产出 dependencies
 
 `build(options, compilation, resolver, fs, callback)`（[NormalModule.js:1175-1370](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1175-L1370)）：
 
-1. **复位**：`_source=null`、`_ast=null`、`error=null`、`clearDependenciesAndBlocks()`、`buildMeta={}`，`buildInfo` 初始 `cacheable:false`（[:1176-1196](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1176-L1196)）；记 `startTime = compiler.fsStartTime || Date.now()`（[:1198](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1198)，接 §10.3）。
+1. **复位**：`_source=null`、`_ast=null`、`error=null`、`clearDependenciesAndBlocks()`、`buildMeta={}`，`buildInfo` 初始 `cacheable:false`（[:1176-1196](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1176-L1196)）；记 `startTime = compiler.fsStartTime || Date.now()`（[:1198](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1198)，接 §8.3）。
 2. **`_doBuild`**（[:916-1087](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L916-L1087)）：建 loaderContext（[:917](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L917)）；**在这里**才 `new LazySet()` 三组依赖并置 `cacheable = true`（[:991-994](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L991-L994)，注意与 `build` 顶部的 `cacheable:false` 不同，真正基线在此）；`hooks.beforeLoaders.call`（[:997](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L997)）；**`runLoaders({ resource, loaders, context, processResource }, cb)`**（[:1013-1023](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1013-L1023)）。`processResource`（[:1023-1041](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1023-L1041)）不走 loader-runner 默认读盘，而是经 `hooks.readResource.for(scheme).callAsync`——这是 webpack 接管资源读取的点。
 3. **回填依赖与 cacheable**（runLoaders 完成回调，[:1043-1085](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1043-L1085)）：`fileDependencies.addAll(result.fileDependencies)` 等（[:1073-1075](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1073-L1075)）、每个 loader 路径进 `buildDependencies`（[:1076-1082](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1076-L1082)）、`buildInfo.cacheable = buildInfo.cacheable && result.cacheable`（[:1083](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1083)）。
 4. **产出 source/ast**（`processResult`，[:930-987](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L930-L987)）：`hooks.processResult` waterfall 允许插件改写 `[source, sourceMap, ast]`（[:945-948](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L945-L948)）→ `this._source = createSource(...)`（[:973-978](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L973-L978)）、`this._ast = extraInfo.webpackAST ?? null`（[:980-985](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L980-L985)）。
-5. **parser 解析**（回到 `build`）：`this.parser.parse(this._ast || source, { source, module: this, compilation, options })`（[:1357-1363](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1357-L1363)）——**副作用填充 `this.dependencies`/`this.blocks`**（即 §8.1 的 Dependency/AsyncDependenciesBlock）。若 `noParse` 命中则跳过 parser 并置 `buildInfo.parsed=false`（[:1346-1351](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1346-L1351)）。
-6. **收尾 + 建快照**：`handleParseResult` 排序依赖（[:1229-1241](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1229-L1241)）→ `handleBuildDone` 里 `createSnapshot(startTime, ...)` 存 `buildInfo.snapshot`（[:1315-1329](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1315-L1329)，接 §10.3）。
+5. **parser 解析**（回到 `build`）：`this.parser.parse(this._ast || source, { source, module: this, compilation, options })`（[:1357-1363](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1357-L1363)）——**副作用填充 `this.dependencies`/`this.blocks`**（即 §7.1 的 Dependency/AsyncDependenciesBlock）。若 `noParse` 命中则跳过 parser 并置 `buildInfo.parsed=false`（[:1346-1351](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1346-L1351)）。
+6. **收尾 + 建快照**：`handleParseResult` 排序依赖（[:1229-1241](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1229-L1241)）→ `handleBuildDone` 里 `createSnapshot(startTime, ...)` 存 `buildInfo.snapshot`（[:1315-1329](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1315-L1329)，接 §8.3）。
 
 generator 不在 build 阶段跑：`this.generator.generate(...)` 在 `codeGeneration({...})`（[:1445-1519](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1445-L1519)，调用点 [:1494-1505](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1494-L1505)）里、seal 阶段才执行，产出各 sourceType 的输出 `Source`（§3.5 第 7 步）。**parser 在 build（造图），generator 在 seal（造码）——两者跨越 build-time 内部的“图 vs 码”边界。**
 
-### 11.5 pitch 从左到右、normal 反向执行、pitch 提前返回跳过什么（契约级）
+### 9.5 pitch 从左到右、normal 反向执行、pitch 提前返回跳过什么（契约级）
 
-loader-runner（`4.3.0`，本 checkout 未安装 `node_modules`，故以下为**包契约级**说明，非源码行号）：给定 `loaders`（§11.2 组装的 post→normal/inline→pre 数组），
+loader-runner（`4.3.0`，本 checkout 未安装 `node_modules`，故以下为**包契约级**说明，非源码行号）：给定 `loaders`（§9.2 组装的 post→normal/inline→pre 数组），
 
 - **pitch 阶段：从左到右**遍历（数组头到尾）依次调用每个 loader 的 `pitch(remainingRequest, precedingRequest, data)`。pitch 从左到右，是为了让靠左（更“外层”、更接近 post 端）的 loader 有机会在读资源前先介入、并把数据通过 `data` 传给对应的 normal 阶段。
-- **资源读取**：所有 pitch 都返回 `undefined` 时，在数组**最右端**（resource 侧）用 `processResource`（webpack 版即 `readResource` hook，§11.4）读入 resource 内容作为初始 source。
+- **资源读取**：所有 pitch 都返回 `undefined` 时，在数组**最右端**（resource 侧）用 `processResource`（webpack 版即 `readResource` hook，§9.4）读入 resource 内容作为初始 source。
 - **normal 阶段：从右到左**遍历，依次把 source 交给每个 loader 的默认导出函数处理。反向执行，是因为最靠近资源（最右）的 loader 应最先看到原始内容、最外层（最左）的最后收尾——形成“洋葱”式包裹。
 - **pitch 提前返回的短路**：若某个 loader 的 `pitch` 返回了**非 `undefined`** 值，loader-runner **立即停止继续向右的 pitch**，**跳过资源读取（不再执行 `processResource`/`readResource`）**，也**跳过该 loader 右侧的所有 loader（包括它们的 pitch 和 normal）**，把这个返回值当作 source，直接从**该 loader（含）向左**进入 normal 阶段。这就是“为什么加了某个 loader 后，右边的 loader 和文件读取都没跑”的根因。
 
-webpack 侧把结果收进 `result.{result,cacheable,fileDependencies,contextDependencies,missingDependencies}`（§11.4 第 3 点），其中 `result[0..2]` = `[source, sourceMap, ast]`。
+webpack 侧把结果收进 `result.{result,cacheable,fileDependencies,contextDependencies,missingDependencies}`（§9.4 第 3 点），其中 `result[0..2]` = `[source, sourceMap, ast]`。
 
-### 11.6 loaderContext 登记依赖 / cacheable / 返回值 / 抛错的影响
+### 9.6 loaderContext 登记依赖 / cacheable / 返回值 / 抛错的影响
 
 loaderContext 对象在 `_createLoaderContext`（[NormalModule.js:594-844](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L594-L844)）构造。**注意归属**：只有 `addBuildDependency`（[:811-818](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L811-L818)）由 webpack 自身定义；`addDependency`/`addContextDependency`/`addMissingDependency`/`cacheable`/`getDependencies` 等由 **loader-runner 注入到 context**（本 checkout 无源码，故无行号）。webpack 侧只能看到它们在 `getResolveContext`（[:606-625](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L606-L625)，把 resolver 发现的路径回灌）与 `runLoaders` 结果回填（[:1073-1075](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1073-L1075)）处的调用点。各行为对前一轮快照/构建/错误传播的影响：
 
-- **登记 file/context/missing dependency**：经 loader-runner 收集 → build 回调 `addAll` 进 `buildInfo` 三组 LazySet（[:1073-1075](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1073-L1075)）→ `handleBuildDone` 写入本模块 `snapshot`（[:1315-1329](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1315-L1329)）。**下一轮** `needBuild` 用 `checkSnapshotValid` 校验这些路径（§10.3）。missingDependency 记录“当时不存在”，其从无到有会令快照失效（§10.5 表“缺失依赖出现”）。**loader 少登记一个 `addDependency`，就直接导致前一轮快照缺该文件 → 改它不失效 → 问题 A。**
+- **登记 file/context/missing dependency**：经 loader-runner 收集 → build 回调 `addAll` 进 `buildInfo` 三组 LazySet（[:1073-1075](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1073-L1075)）→ `handleBuildDone` 写入本模块 `snapshot`（[:1315-1329](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1315-L1329)）。**下一轮** `needBuild` 用 `checkSnapshotValid` 校验这些路径（§8.3）。missingDependency 记录“当时不存在”，其从无到有会令快照失效（§8.5 表“缺失依赖出现”）。**loader 少登记一个 `addDependency`，就直接导致前一轮快照缺该文件 → 改它不失效 → 问题 A。**
 - **声明 cacheable(false)**：loader-runner 把它并入 `result.cacheable`，webpack 在 [:1083](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1083) 做 `&&` 合并。若最终 `buildInfo.cacheable === false`，`handleBuildDone` 不建 snapshot（[:1251-1254](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1251-L1254) 附近的 cacheable/snapshotOptions 判定），且 `needBuild` 因 `!cacheable` 恒重建（[:1552](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1552)）——**每轮必重建（问题 B 的合理来源）**。
 - **返回 source/map/AST**：`[source, sourceMap, ast]` 经 `processResult` → `_source`/`_ast`（[:973-985](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L973-L985)）。若返回了 `webpackAST`，parser 直接吃 AST 跳过重新解析（[:1357](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1357) 的 `this._ast || source`）。source 非 Buffer/String 会成 `ModuleBuildError`（[:953-966](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L953-L966)）。
 - **抛错**：loader 抛出 → `processResult` 包成 `new ModuleBuildError(err, { from: <loader 路径> })`（[:936-942](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L936-L942)）→ `_doBuild` 回调 → `build` 里 `markModuleAsErrored(err)`（[:1204-1208](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1204-L1208)），它设 `this.error`、`addError`（[:1093-1098](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1093-L1098)）。**关键：build 错误不经 `callback(err)` 冒泡**，而是记在模块上并 `callback()` 无错返回——所以一个 loader 失败不会中断整轮编译，错误随 `Stats` 汇总。parser 抛错则走 `handleParseError` → `ModuleParseError`（[:1214-1227](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1214-L1227)）。`emitWarning`/`emitError`（[:725-744](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L725-L744)）走 `ModuleWarning`/`ModuleError`，非致命。带 `error` 的模块在 `codeGeneration` 里用 `generateError` 或 `throw new Error(...)` 占位（[:1479-1493](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1479-L1493)）。
 
-### 11.7 loader 与 compiler plugin 能观察/改变的边界
+### 9.7 loader 与 compiler plugin 能观察/改变的边界
 
 用源码调用点区分“谁能看到什么、改什么”：
 
@@ -489,22 +489,169 @@ loaderContext 对象在 `_createLoaderContext`（[NormalModule.js:594-844](file:
 | 登记 file/context/missing dep | ✅ `addDependency` 等（loader-runner 注入） | 只能间接（改 loaderContext 或读 `buildInfo`） | [NormalModule.js:606-625](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L606-L625) |
 | 改写 loader 返回的 source/map/ast | ✅ 直接返回 | `hooks.processResult`（waterfall） | [NormalModule.js:945-948](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L945-L948) |
 | loader 执行前后 | pitch/normal 自身 | `hooks.beforeLoaders`/`beforeParse`/`beforeSnapshot` | [NormalModule.js:997](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L997)、[:1336](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1336)、[:1245](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1245) |
-| 观察/改依赖图（dependencies/blocks） | 不能（parser 内部产出） | tap parser hook（§8.1）或 `compilation.hooks.finishModules` 等 | §8.1 / [Compilation.js:2984](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L2984) |
+| 观察/改依赖图（dependencies/blocks） | 不能（parser 内部产出） | tap parser hook（§7.1）或 `compilation.hooks.finishModules` 等 | §7.1 / [Compilation.js:2984](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L2984) |
 | 资源读取本身 | 通过 pitch 短路可跳过 | `hooks.readResource.for(scheme)` | [NormalModule.js:1026-1040](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1026-L1040) |
 
 一句话边界：**loader 活在 `_doBuild` 的 loaderContext 里，只能操作单个资源→source 的转换与依赖登记；compiler/compilation plugin 活在工厂与 `NormalModule.getCompilationHooks` 的 hook 上，能决定选哪些 loader、换掉模块、扩展 loaderContext、改写结果、以及观察构建后的整张图。** 两者在 `runLoaders` 的调用点（[NormalModule.js:1013](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1013)）交接。
 
 ---
 
-## 9. 待核实 / 未证实清单（后续深入方向）
+## 10. 事故复盘推演：多入口 + 共享依赖 + 动态 import + splitChunks + filesystem cache + watch
+
+本节把 §1–§9 的机制串成**一次可用于事故复盘的完整时间线**。每一步显式指出沿用了前文的哪个对象 / 图关系 / 依赖记录 / hook / runtime 产物，以及“为什么复用或失效”。凡是无法从当前版本源码逐行确认的（如 `SplitChunksPlugin` 具体抽取判据、`version` salt 组成、loader-runner 内部），一律以 **未证实** 标注，不润色成事实。
+
+### 10.0 场景配置
+
+```js
+// webpack.config.js（web target）
+module.exports = {
+  mode: "production",
+  entry: { entryA: "./src/entryA.js", entryB: "./src/entryB.js" },
+  output: { filename: "[name].[contenthash].js", path: __dirname + "/dist" },
+  module: {
+    rules: [{ test: /\.js$/, use: [{ loader: "./my-loader.js" }] }]
+  },
+  optimization: {
+    splitChunks: { chunks: "all", minChunks: 2 }, // 让 shared 可被抽取
+    runtimeChunk: "single"
+  },
+  cache: { type: "filesystem" },
+  watch: true
+};
+// entryA.js: import {s} from "./shared"; import("./lazy");
+// entryB.js: import {s} from "./shared";
+// my-loader.js: 读取并 addDependency 一个外部 config（如 ./ext.json）
+```
+
+- `entryA`、`entryB` 都静态依赖 `shared`；`entryA` 另有动态 `import("./lazy")`。
+- `my-loader` 处理每个 `.js`，并在 loaderContext 上登记一个**外部文件** `ext.json`（`addDependency`）。
+- 开了 `splitChunks`、`runtimeChunk:"single"`、`cache:{type:"filesystem"}`、`watch:true`。
+
+装配期（§1–§2，同步）：`createCompiler` 依次跑规范化/默认值、`new Compiler`、用户与内建插件。其中 `WebpackOptionsApply` 装上 `SplitChunksPlugin`（[WebpackOptionsApply.js:502-503](file:///e:/newGsb/questions/GSB-013/Thor/lib/WebpackOptionsApply.js#L502-L503)）、`RuntimeChunkPlugin`（[:506-507](file:///e:/newGsb/questions/GSB-013/Thor/lib/WebpackOptionsApply.js#L506-L507)）、`EntryOptionPlugin`（两个 `EntryPlugin`，§2.1）、`RuntimePlugin`，以及 filesystem cache 的 `IdleFileCachePlugin(new PackFileCacheStrategy(...))`（[:711-714](file:///e:/newGsb/questions/GSB-013/Thor/lib/WebpackOptionsApply.js#L711-L714)）。因 `watch:true`，`webpack()` 走 `compiler.watch(...)`（§1、§5.1），`Watching` 构造末尾 `process.nextTick` 触发首轮 `_invalidate`（[Watching.js:74-76](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L74-L76)）。
+
+### 10.1 冷启动构建 → 首次写出
+
+**T0 开一轮（watch/cache 域交接 build-time）**：`_go` 设 `compiler.fsStartTime`（[Watching.js:121](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L121)）→ `cache.endIdle`（此时 `PackFileCacheStrategy._openPack` 尝试读磁盘 pack；冷启动无 pack 或 `version` 不匹配 → 返回空 Pack，[PackFileCacheStrategy.js:1197-1202](file:///e:/newGsb/questions/GSB-013/Thor/lib/cache/PackFileCacheStrategy.js#L1197-L1202)）→ `watchRun` → `compiler.compile`（§3.2）。**沿用**：`Compiler`/`Cache`（长命，§6）。**为何不复用**：磁盘无有效 pack，全部模块从零构建。
+
+**T1 make（build-time，造图）**：`EntryPlugin` 的 `make` tap 对 `entryA`/`entryB` 各调 `compilation.addEntry`（§2.1、§3.3）。`make` 是 `AsyncParallelHook`，两入口并行展开。每个模块经 §9 的 `NormalModuleFactory.create`（factorize→resolve→createModule）确定 `resource`/`loaders`，再 `NormalModule.build` 跑 `my-loader`（§9.4）。`my-loader` 通过 loaderContext `addDependency(ext.json)`（loader-runner 注入，**契约级**），回填进 `buildInfo.fileDependencies`（[NormalModule.js:1073-1075](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1073-L1075)），并在 build 末尾进该模块 snapshot（[:1315-1329](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1315-L1329)）。parser 产出 Dependency/Block：`shared` 是 `HarmonyImportSideEffectDependency`（两入口各一条边指向**同一个 Module**），`import("./lazy")` 是含 `ImportDependency` 的 `AsyncDependenciesBlock`（§7.1）。**沿用**：`ModuleGraph`（构造即在，[Compilation.js:1057](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L1057)），逐步填充。
+
+**T2 finish（build-time）**：`finishModules`（[Compilation.js:2984](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L2984)）。`ModuleGraph` 完整、`ChunkGraph` 仍 `undefined`（§3.4）。
+
+**T3 seal → chunk 图（build-time，造 chunk）**：`new ChunkGraph(...)`（[Compilation.js:3063](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L3063)）。按 entries 造 `entryA`/`entryB` 两入口 chunk 与 `Entrypoint`，`buildChunkGraph`（[:3227](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L3227)）铺模块：裸算法下 `shared` 会被 `connectChunkAndModule` 连进**两个** entry chunk（§7.3），`lazy` 经 `iteratorBlock`→`addChunkInGroup`（[:3897](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L3897)）得独立 async chunk。
+
+**T4 splitChunks（build-time，优化 chunk）**：`SplitChunksPlugin` tap `compilation.hooks.optimizeChunks`（[optimize/SplitChunksPlugin.js:833](file:///e:/newGsb/questions/GSB-013/Thor/lib/optimize/SplitChunksPlugin.js#L833)），在 seal 的 `optimizeChunks` while 循环（[Compilation.js:3239](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L3239)）里运行。因 `shared` 被 ≥2 个 chunk 引用且满足 `minChunks:2`，它被抽进一个独立的 split chunk，从两个 entry chunk 移除。`runtimeChunk:"single"` 由 `RuntimeChunkPlugin` 造一个公共 runtime chunk。**具体抽取判据（minSize/cacheGroups 等）未逐行读，标注 未证实**（§13）；确定的是它挂在 `optimizeChunks` 且改动 `ChunkGraph` 的 module↔chunk 连接。
+
+**T5 code generation + runtime（build-time→output-runtime）**：`module.codeGeneration`（seal 第 7 步，§3.5）里 `ImportDependency.Template` 生成 `__webpack_require__.e(chunkId).then(...)` 并登记 `RuntimeGlobals.ensureChunk`；静态 import 生成 `__webpack_require__(id)` + `require`（§7.4）。`processRuntimeRequirements`（[Compilation.js:3328](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L3328)）把 `ensureChunk`→`EnsureChunkRuntimeModule`、`ensureChunkHandlers`→`JsonpChunkLoadingRuntimeModule`（§7.5），经 `addRuntimeModule`（[:3843](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L3843)）打进 runtime chunk。`createHash` 用 `[contenthash]` 定文件名。**runtime 产物**：`.e`/`.f.j` 装载器即“写入产物的 runtime”。
+
+**T6 首次写出（output 域）**：`shouldEmit` 不短路 → `Compiler.emitAssets`（§4）→ `hooks.emit` → 逐个 `writeFile` 到 `dist/`。首次全部落盘（`_assetEmittingWrittenFiles` 为空）。
+
+**T7 收尾（watch/cache 域）**：`_done`（§8.2）`storeBuildDependencies(compilation.buildDependencies)` → `cache.beginIdle()`（[Watching.js:326-327](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L326-L327)）→ idle 定时器触发 `PackFileCacheStrategy.afterAllStored`，把 pack + `buildSnapshot`/`resolveBuildDependenciesSnapshot` + `version` 序列化到磁盘（§8.4）→ 按 `compilation.fileDependencies/contextDependencies/missingDependencies` **重挂 watcher**（[:329-340](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L329-L340)）。此时 watcher 监听：所有源文件、`ext.json`（因 my-loader 登记）、`lazy`、`shared` 等。
+
+### 10.2 推演一：入口源码变化（改 `entryA.js`）
+
+**触发**：watcher change 回调 → `_invalidate` → `_mergeWithCollected`（[Watching.js:83-100](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L83-L100)）；非 running 则 `_go`。`_go` 设新 `fsStartTime`、`compiler.modifiedFiles={entryA.js}`（[:155](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L155)），`cache.endIdle`（内存 pack 仍在，`version`/`buildSnapshot` 未变 → **保留**，§8.4）。
+
+**单模块判定（§8.3）**：`needBuild` 对每个模块 `checkSnapshotValid`。`entryA` 的 snapshot 因其文件 timestamp/hash 变（或 `safeTime>fsStartTime`）而**失效** → 重建 + 重解析（重跑 my-loader + parser）。`shared`/`lazy`/`entryB` 的 snapshot 仍有效 → **不重建**（`stillValidModule`），且持久缓存中它们的 build 结果按 etag=null + snapshot 复用（[Compilation.js:1433](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L1433)）。
+
+**图/chunk/写出**：`entryA` 重解析后若依赖集不变，`ModuleGraph` 出边不变；seal 重新造 `ChunkGraph`（每轮全新，§3.4），splitChunks 重跑。`entryA` 内容变 → 其 chunk 的 `[contenthash]` 变 → codegen etag（`${hash}|...`，[Compilation.js:3639-3640](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L3639-L3640)）变 → **重新生成**该 chunk；`shared`/`lazy` 若 hash 未变则 codegen 结果复用。写出阶段 `emitAssets` 的 `compareBeforeEmit` 让**未变文件跳过写盘**，仅变化的 `entryA.[hash].js`（及可能受 hash 传播影响的 runtime chunk）落盘。**结论**：局部重建 + 局部重写，符合预期。
+
+### 10.3 推演二：loader 登记的外部文件变化（改 `ext.json`）
+
+**触发**：`ext.json` 在上一轮被 `my-loader` 的 `addDependency` 登记 → 进了 `compilation.fileDependencies` → §10.1 T7 重挂 watcher 时**被监听**。改它 → 正常触发新一轮。
+
+**为何失效/正确**：`ext.json` 在**引用它的那些模块**（所有 `.js`，因规则 `test:/\.js$/`）的 snapshot 内 → 这些模块 `checkSnapshotValid` 失效 → 全部重建 + 重解析。**沿用**：`buildInfo.fileDependencies`→snapshot 记录（§8.3、§9.6）。**关键因果**：正是 loader 那一句 `addDependency` 让 `ext.json` 既被 watch 又进 snapshot；**若 my-loader 漏了 addDependency**，`ext.json` 既不被监听也不进 snapshot → 改它无任何反应 = 问题 A（stale reuse），根因在 loader 未登记，不在缓存核心（§8.5 表“loader 读了却未登记依赖”行）。
+
+### 10.4 推演三：构建过程中二次 invalid
+
+**场景**：§10.2/§10.3 的某轮正在 running 时，又有文件改动。`_invalidate` 因 `this.running` 为真，**只**合并进 collected 并置 `this.invalid=true`（[Watching.js:431-433](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L431-L433)），不立刻开新轮。
+
+**本轮如何收尾**：`onCompiled`/`_done` 中若发现 `this.invalid`，`_done` 的**再失效分支**（[:281-298](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L281-L298)）`storeBuildDependencies` 后直接 `_go()`，**不进 idle**，立即用上一轮合并进 collected 的变更开下一轮。**正确性护栏**：构建途中被改的文件，其 `safeTime > 本轮 fsStartTime`，在**下一轮** `checkSnapshotValid` 必判失效（[FileSystemInfo.js:2829](file:///e:/newGsb/questions/GSB-013/Thor/lib/FileSystemInfo.js#L2829)）→ 保证不会把“读到一半的旧内容”当成已消化。**沿用**：`compiler.fsStartTime` 作为每轮读盘起点（§8.3 第 3 点）。
+
+### 10.5 推演四：下一次重启命中持久缓存（filesystem cache）
+
+**场景**：进程退出后重启 `webpack --watch`（同一 webpack 版本、同一配置、`node_modules`/loader 未变）。
+
+**命中路径**：`cache.endIdle` → `PackFileCacheStrategy._openPack` 读磁盘 pack。三重校验（§8.4）：① `packContainer.version === version`（[PackFileCacheStrategy.js:1197-1202](file:///e:/newGsb/questions/GSB-013/Thor/lib/cache/PackFileCacheStrategy.js#L1197-L1202)）；② `checkSnapshotValid(buildSnapshot)`（build 依赖=loader/config/webpack 未变 → 有效，[:1206-1225](file:///e:/newGsb/questions/GSB-013/Thor/lib/cache/PackFileCacheStrategy.js#L1206-L1225)）；③ resolve 快照有效（[:1228-1268](file:///e:/newGsb/questions/GSB-013/Thor/lib/cache/PackFileCacheStrategy.js#L1228-L1268)）。三者皆过 → 加载旧 pack。
+
+**复用什么**：`_modulesCache.get(identifier, null)`（[Compilation.js:1433](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L1433)）取回上次的 `NormalModule`（含 `_source`、`buildInfo.snapshot`）；`needBuild` 再用 snapshot 对当前磁盘 `checkSnapshotValid`——未改的文件有效 → **跳过 build（连 loader 都不跑）**。codegen 缓存按真 etag 复用（[:3639-3640](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L3639-L3640)）。**为何仍要 seal**：`ChunkGraph`/`CodeGenerationResults`/`assets` 都是 build-time-only（§7 结尾、§6），不序列化，故每次重启仍重新 seal，但基于复用的模块，速度快。
+
+**何时反而整轮重做（问题 B 的合理来源）**：若升级了 webpack、改了 `webpack.config.js`、或换了 loader 版本 → `version` 不匹配或 `buildSnapshot` 失效 → 整个 pack 作废（§8.4）→ 冷启动式全量重建。这是**预期行为**，不是 bug。`version` salt 的精确组成 **未证实**（§13）。
+
+### 10.6 复盘速查：每步沿用与复用/失效理由
+
+| 时刻 | 域 | 沿用的前文对象/记录 | 复用 or 失效 | 依据 |
+| --- | --- | --- | --- | --- |
+| 冷启动 make | build-time | `ModuleGraph`（构造即在）、`NormalModuleFactory`（每轮新建） | 全量构建（无 pack） | §3.3/§9、[PackFileCacheStrategy.js:1197](file:///e:/newGsb/questions/GSB-013/Thor/lib/cache/PackFileCacheStrategy.js#L1197) |
+| 冷启动 seal | build-time | `ChunkGraph`（seal 新建）、splitChunks 于 `optimizeChunks` | 首次生成 | [Compilation.js:3063](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L3063)/[:3239](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L3239) |
+| 首次写出 | output | `compilation.assets`、`emitAssets` | 全部落盘 | §4 |
+| 改 entryA | build-time | `entryA.buildInfo.snapshot` | 失效重建；其余复用 | [NormalModule.js:1576](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1576) |
+| 改 ext.json | build-time | 各 `.js` 模块 snapshot 内的 fileDependency | 失效重建（因 loader 登记过） | §9.6、[NormalModule.js:1073-1075](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1073-L1075) |
+| 构建中二次 invalid | watch/cache | `this.invalid`、`collected`、`fsStartTime` | 本轮完成后再跑一轮 | [Watching.js:431-433](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L431-L433)/[:281-298](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L281-L298) |
+| 重启命中缓存 | watch/cache→build-time | 磁盘 pack、`buildSnapshot`、模块 snapshot | 命中则跳过 build，仍重 seal | §8.4、[Compilation.js:1433](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L1433) |
+
+---
+
+## 11. 全文一致性审校（顺序与所有权）
+
+对用户点名的五条链路做交叉核对，确认全文无自相矛盾；结论均可回到源码。
+
+1. **public API → `Compiler`**（§1）：`webpack()` → `createCompiler` 顺序固定为 规范化 → baseDefaults → `new Compiler` → NodeEnvironmentPlugin → 用户插件 → `applyWebpackOptionsDefaults` → `WebpackOptionsApply.process` → `initialize`，全同步（[webpack.js:65-97](file:///e:/newGsb/questions/GSB-013/Thor/lib/webpack.js#L65-L97)）。**所有权**：`Compiler` 由调用方持有，长命。全文一致。
+2. **`Compiler` → `Compilation`**（§3.2–§3.3）：`compile` 每次 `new Compilation`（[Compiler.js:1317](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compiler.js#L1317)），`Compilation` 短命。§5.1/§8/§10 反复强调“每轮全新 Compilation”，与 §3.2 一致，无矛盾。
+3. **异步块 → chunk/runtime**（§7）：`AsyncDependenciesBlock`（build-time，挂 `module.blocks`）→ `buildChunkGraph` 造 async chunk → `ImportDependency.Template` 生成 `.e(chunkId)` → `RuntimeModule` 落地。§7.6 的“只存在于构建期 / 翻译进 runtime / 跨编译存活”三分法与 §6 生命周期表、§10.1 T5 一致。
+4. **watch/cache**（§5、§8、§10）：`Watching` 长命、每轮触发 `compiler.compile`；`Cache` hook 驱动、idle 落盘。§5.3 的 run-idle 握手（非 watch）与 §8.1/§8.2 的 watch 握手是**两条并列路径**（一个走 `Compiler.run`，一个走 `Watching._go`），均设/清 `fsStartTime`、均 `beginIdle/endIdle`——已在 §10.1/§10.4 明确区分，不矛盾。
+5. **loader/plugin 边界**（§9.7）：loader 活在 `_doBuild` 的 loaderContext；plugin 活在工厂与 compilation hook；交接点 `runLoaders`（[NormalModule.js:1013](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1013)）。§10.2/§10.3 对 my-loader `addDependency` 的因果描述与 §9.6 一致。
+
+**已消除/澄清的潜在冲突点**：
+- “`factorizeQueue`”一词：§3.3 指 **`Compilation` 侧**的 `AsyncQueue`；§9.1 明确 **`NormalModuleFactory` 本身不排队**（无 AsyncQueue，靠 hook callAsync）。两处指的是不同对象，§9 版本注记已点明，避免误读。
+- “`cacheable`”基线：§9.4 已澄清 `build` 顶部 `buildInfo.cacheable:false` 只是占位，真正基线 `true` 在 `_doBuild`（[NormalModule.js:991-994](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L991-L994)），与 §8.3 `needBuild` 的 `!cacheable` 判定不冲突。
+- 章节顺序：本轮已把物理顺序整理为 §0→§9 单调递增（§7 场景、§8 watch 失效、§9 build 前），§13 为未证实清单；所有 `§x.y` 交叉引用已同步更新。
+
+---
+
+## 12. 关键结论证据索引（按文件 / symbol / hook）
+
+下表为复盘时可直接跳转的证据锚点。**已证实**=已在当前 checkout 逐行读到；**未证实**=见 §13。
+
+| 结论 | 文件:行 / symbol / hook | 状态 |
+| --- | --- | --- |
+| `webpack()` 装配顺序（含默认值必须晚于用户插件） | [webpack.js:65-97](file:///e:/newGsb/questions/GSB-013/Thor/lib/webpack.js#L65-L97) `createCompiler` | 已证实 |
+| `Compiler` 构造持有 `resolverFactory`/`cache` | [Compiler.js:266](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compiler.js#L266)/[:287](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compiler.js#L287) | 已证实 |
+| `make` 是 AsyncParallelHook（多入口并行） | [Compiler.js:180](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compiler.js#L180) `hooks.make` | 已证实 |
+| entry → `EntryPlugin` tap `make`→`addEntry` | [EntryPlugin.js:47-51](file:///e:/newGsb/questions/GSB-013/Thor/lib/EntryPlugin.js#L47-L51) | 已证实 |
+| `compile` 每轮 `new Compilation` | [Compiler.js:1317](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compiler.js#L1317) `newCompilation` | 已证实 |
+| `ModuleGraph` 构造即在 | [Compilation.js:1057](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L1057) | 已证实 |
+| `ChunkGraph` 仅 seal 创建（此前 undefined） | [Compilation.js:1059](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L1059)/[:3063](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L3063) | 已证实 |
+| `buildChunkGraph` 铺 module→chunk | [Compilation.js:3227](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L3227)；[buildChunkGraph.js:1301](file:///e:/newGsb/questions/GSB-013/Thor/lib/buildChunkGraph.js#L1301) | 已证实 |
+| 共享模块可属多 chunk（SortableSet） | [ChunkGraph.js:201-202](file:///e:/newGsb/questions/GSB-013/Thor/lib/ChunkGraph.js#L201-L202)/[:343-348](file:///e:/newGsb/questions/GSB-013/Thor/lib/ChunkGraph.js#L343-L348) | 已证实 |
+| async chunk available-modules 去重 | [buildChunkGraph.js:707-711](file:///e:/newGsb/questions/GSB-013/Thor/lib/buildChunkGraph.js#L707-L711) | 已证实 |
+| splitChunks 挂 `optimizeChunks` | [optimize/SplitChunksPlugin.js:833](file:///e:/newGsb/questions/GSB-013/Thor/lib/optimize/SplitChunksPlugin.js#L833)；wiring [WebpackOptionsApply.js:502-503](file:///e:/newGsb/questions/GSB-013/Thor/lib/WebpackOptionsApply.js#L502-L503) | 已证实（tap 点）；抽取判据 未证实 |
+| 动态 import codegen `.e().then()` | [ImportDependency.js:116](file:///e:/newGsb/questions/GSB-013/Thor/lib/dependencies/ImportDependency.js#L116)；[RuntimeTemplate.js:1009](file:///e:/newGsb/questions/GSB-013/Thor/lib/RuntimeTemplate.js#L1009) | 已证实 |
+| runtimeRequirements 扇出 → RuntimeModule | [Compilation.js:3328](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L3328)/[:3843](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L3843)；[RuntimePlugin.js:371-380](file:///e:/newGsb/questions/GSB-013/Thor/lib/RuntimePlugin.js#L371-L380) | 已证实 |
+| 写盘与跳过（compareBeforeEmit） | [Compiler.js:676-1021](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compiler.js#L676-L1021) `emitAssets` | 已证实 |
+| Watching 首轮 nextTick 自失效 | [Watching.js:74-76](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L74-L76) | 已证实 |
+| 变更合并 / running 延后 / 再失效分支 | [Watching.js:83-100](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L83-L100)/[:431-433](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L431-L433)/[:281-298](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L281-L298) | 已证实 |
+| 重挂 watcher 用 compilation 三组依赖 | [Watching.js:329-340](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L329-L340) | 已证实 |
+| snapshot 时间护栏 `safeTime>startTime` | [FileSystemInfo.js:2829](file:///e:/newGsb/questions/GSB-013/Thor/lib/FileSystemInfo.js#L2829) | 已证实 |
+| `needBuild` 决策阶梯 | [NormalModule.js:1540-1591](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1540-L1591) | 已证实 |
+| loader 依赖回填进 snapshot | [NormalModule.js:1073-1075](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1073-L1075)/[:1315-1329](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1315-L1329) | 已证实 |
+| 持久缓存三重校验（version/build/resolve） | [PackFileCacheStrategy.js:1197-1268](file:///e:/newGsb/questions/GSB-013/Thor/lib/cache/PackFileCacheStrategy.js#L1197-L1268) | 已证实（校验逻辑）；version 组成 未证实 |
+| codegen 缓存 etag=`hash\|depTplHash` | [Compilation.js:3639-3640](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L3639-L3640) | 已证实 |
+| NMF factorize/resolve/createModule/module hook | [NormalModuleFactory.js:286-294](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L286-L294)/[:869-953](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L869-L953) | 已证实 |
+| loader 顺序组装 post→normal/inline→pre | [NormalModuleFactory.js:655-713](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModuleFactory.js#L655-L713) | 已证实 |
+| `runLoaders` 调用点 / build 错误不冒泡 | [NormalModule.js:1013](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1013)/[:1204-1208](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1204-L1208) | 已证实 |
+| pitch 左→右 / normal 右→左 / 短路 | loader-runner `4.3.0`（未装 node_modules） | 未证实（契约级） |
+
+---
+
+## 13. 待核实 / 未证实清单（后续深入方向）
 
 以下为**未直接读源确认**的点，标为 **未证实**，避免误导：
 
-- **未证实**：`SplitChunksPlugin` 在 `optimizeChunks` 阶段抽取共享模块（把 §8.3 中被复制的 `shared` 提成独立 chunk）的具体判据（`minChunks`/`minSize`/`cacheGroups`）尚未逐行读。
-- **未证实**：`runtimeChunk` 选项如何决定 runtime code 落在独立 runtime chunk 还是并入 entry chunk（§8.5 里 `addRuntimeModule` 的目标 chunk 选择）。
+- **未证实**：`SplitChunksPlugin` 在 `optimizeChunks` 阶段抽取共享模块（把 §7.3 中被复制的 `shared` 提成独立 chunk）的具体判据（`minChunks`/`minSize`/`cacheGroups`）尚未逐行读。
+- **未证实**：`runtimeChunk` 选项如何决定 runtime code 落在独立 runtime chunk 还是并入 entry chunk（§7.5 里 `addRuntimeModule` 的目标 chunk 选择）。
 - **未证实**：`PackFileCacheStrategy` 的 `version`/salt 精确由哪些输入（webpack 版本、config 指纹、`cache.version` 等）在**本文件上游**如何拼成，尚未逐行确认。
-- **未证实（无法给行号）**：`loader-runner` 包（`package.json` 声明 `^4.2.0`，[yarn.lock](file:///e:/newGsb/questions/GSB-013/Thor/yarn.lock) 锁定 `4.3.0`）在**本 checkout 未安装 `node_modules`**，其 `runLoaders` / `iteratePitchingLoaders` / `iterateNormalLoaders` 以及 `loaderContext` 上注入的 `addDependency`/`addContextDependency`/`addMissingDependency`/`cacheable` 等方法的具体实现无法给出行号；§11 对 pitch/normal 语义的描述基于该包的公开契约与 webpack 侧调用点，标注为“契约级”而非源码级。
+- **未证实（无法给行号）**：`loader-runner` 包（`package.json` 声明 `^4.2.0`，[yarn.lock](file:///e:/newGsb/questions/GSB-013/Thor/yarn.lock) 锁定 `4.3.0`）在**本 checkout 未安装 `node_modules`**，其 `runLoaders` / `iteratePitchingLoaders` / `iterateNormalLoaders` 以及 `loaderContext` 上注入的 `addDependency`/`addContextDependency`/`addMissingDependency`/`cacheable` 等方法的具体实现无法给出行号；§9 对 pitch/normal 语义的描述基于该包的公开契约与 webpack 侧调用点，标注为“契约级”而非源码级。
 - **未证实**：`MultiCompiler`（[lib/MultiCompiler.js](file:///e:/newGsb/questions/GSB-013/Thor/lib/MultiCompiler.js)）如何按 `setDependencies` 调度子 compiler 的先后与并行。
-- **未证实**：`JavascriptParser`（[lib/javascript/JavascriptParser.js](file:///e:/newGsb/questions/GSB-013/Thor/lib/javascript/JavascriptParser.js)）内部 AST 遍历与各 `hooks.*` 触发次序的完整细节（§8.1 只覆盖了 import 相关 hook）。
+- **未证实**：`JavascriptParser`（[lib/javascript/JavascriptParser.js](file:///e:/newGsb/questions/GSB-013/Thor/lib/javascript/JavascriptParser.js)）内部 AST 遍历与各 `hooks.*` 触发次序的完整细节（§7.1 只覆盖了 import 相关 hook）。
 
 > 需要时可用仓库现有 Jest（`yarn jest <file>`）与 TypeScript（`yarn type-check` 相关脚本，见 [package.json](file:///e:/newGsb/questions/GSB-013/Thor/package.json)）在不改生产代码的前提下核对上述行为。
