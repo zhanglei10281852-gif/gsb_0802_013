@@ -331,13 +331,96 @@ seal 的代码生成阶段（§3.5 第 7 步）对每个模块调 `module.codeGe
 
 ---
 
+## 10. watch 模式失效与缓存复用：排查“改了没生效 / 没改却重做”
+
+本节沿用三域（build-time / output-runtime / watch-cache）与对象所有权，专门支撑两类线上问题的排查：
+- **A. 文件改了却复用旧结果**（stale reuse）——本该重建/重解析的模块被判为“可复用”。
+- **B. 什么都没改却整轮重做**（over-rebuild）——本该整体复用的却重新构建。
+
+两类问题的判定权分散在三个层次：`Watching`（要不要开新一轮、这轮认为哪些文件变了）→ `NormalModule.needBuild` + `FileSystemInfo` snapshot（单模块要不要重建）→ `PackFileCacheStrategy` + build/resolve snapshot（持久化缓存整体是否作废）。**弄错在哪一层，就会误判 A 还是 B。**
+
+### 10.1 `Watching` 收到 invalidation：汇总变更 → 暂停 watcher → 开新 compile
+
+文件监听回调进入 [Watching.js](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js)：
+
+1. **汇总 changed/removed**：`watch(...)` 注册的 change 回调调 `_invalidate(fileTimeInfoEntries, contextTimeInfoEntries, changedFiles, removedFiles)`（[Watching.js:379-384](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L379-L384)）。`_invalidate`（[:420-442](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L420-L442)）把本次变更并入 `_collectedChangedFiles` / `_collectedRemovedFiles`，合并逻辑在 `_mergeWithCollected`（[:83-100](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L83-L100)）——**“后事件覆盖”**：changed 里出现的从 removed 里删掉，反之亦然。
+2. **运行中再次 invalid 的合并（关联问题 B/A）**：若 `this.running`，`_invalidate` **只**把变更并入 collected 并置 `this.invalid = true`（[:431-433](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L431-L433)），**不**立刻开新构建；被推迟到下一轮。若 `suspended`/`blocked`，只合并不置位（[:426-429](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L426-L429)）。
+3. **`_go` 开一轮**（[:109-239](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L109-L239)）：
+   - **暂停 watcher**：`pausedWatcher = watcher`、`watcher.pause()`、`watcher = null`、记 `lastWatcherStartTime`（[:113-120](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L113-L120)）。
+   - **设 `compiler.fsStartTime = Date.now()`**（[:121](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L121)）——这是本轮的“读盘起点”，后面 snapshot 校验的关键时间基准（§10.3）。
+   - **取时间信息**：优先用回调 params，其次 `pausedWatcher.getInfo()`，再退化到 `getAggregatedChanges()`（[:122-153](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L122-L153)）。
+   - **把变更交给 compiler 并清空 collected**：`compiler.modifiedFiles = _collectedChangedFiles`（[:155](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L155)）/ `compiler.removedFiles = _collectedRemovedFiles`（[:157](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L157)），随即置 `undefined`（[:156-158](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L156-L158)）。**consume-and-clear**：此后到达的变更只能靠步骤 2 的 running 合并进入下一轮。
+   - **进新 compile**：若 idle 先 `cache.endIdle`（[:161-167](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L161-L167)）→ `readRecords`（[:168-175](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L168-L175)）→ 复位 `invalid=false`（[:176](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L176)）→ `compiler.hooks.watchRun.callAsync`（[:178](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L178)）→ **`compiler.compile(onCompiled)`**（[:234](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L234)）。**每轮都是全新的 `Compilation`**（§3.2），旧 `Compilation` 的图/资产不跨轮携带——跨轮复用只能来自 `Cache`（§10.4）。
+
+### 10.2 `_done`：收尾、按 compilation 依赖重挂 watcher、再失效分支
+
+`_done`（[Watching.js:255-346](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L255-L346)）：
+
+- **再失效分支（不进 idle 直接开下一轮）**：若 `this.invalid`（构建期间有新变更）且未 suspended/blocked，`storeBuildDependencies` 后直接 `_go()`（[:281-298](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L281-L298)）——这里消费上一轮 running 合并进 collected 的变更。
+- **正常收尾**：建 `Stats`（[:303-307](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L303-L307)）→ `done` hook（[:314](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L314)）→ `cache.storeBuildDependencies(compilation.buildDependencies, ...)`（[:318-321](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L318-L321)）→ **`cache.beginIdle()` + `compiler.idle = true`**（[:326-327](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L326-L327)）。
+- **重挂 watcher**：`process.nextTick` 里 `this.watch(compilation.fileDependencies, compilation.contextDependencies, compilation.missingDependencies)`（[:329-340](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L329-L340)）。**下一轮监听哪些路径，完全由上一轮 `Compilation` 汇总出的三组依赖决定**（§10.3 第 4 点）。若某依赖没被登记，改它就不会触发 invalidation → 表现为问题 A。
+
+失效发生的三条边界（本节主题）：
+- **编译图边界**：`compiler.modifiedFiles/removedFiles`（[:155-157](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L155-L157)）影响 `FileSystemInfo` 的“已知变更”，进而决定 `needBuild` 重建哪些模块 → 决定 ModuleGraph 哪些节点重解析。
+- **代码生成结果边界**：模块即便不重建，其 code generation 结果是否复用由 `_codeGenerationCache` 的 etag 决定（§10.4）。
+- **写出资产边界**：即便重新生成了 assets，`Compiler.emitAssets` 仍可能因 `compareBeforeEmit`/immutable 跳过实际写盘（见 §4）——“重新生成”≠“重新写盘”。
+
+### 10.3 `FileSystemInfo` snapshot 与四类依赖：单模块复用的判据
+
+**snapshot 保存什么事实**（[FileSystemInfo.js](file:///e:/newGsb/questions/GSB-013/Thor/lib/FileSystemInfo.js) `class Snapshot` [:271-306](file:///e:/newGsb/questions/GSB-013/Thor/lib/FileSystemInfo.js#L271-L306)）：文件/目录的 timestamp、hash 或两者（`snapshot.<type>` 的 mode，[:2203](file:///e:/newGsb/questions/GSB-013/Thor/lib/FileSystemInfo.js#L2203)）、**missing 文件的“当时不存在”事实**（`missingExistence`，[:295](file:///e:/newGsb/questions/GSB-013/Thor/lib/FileSystemInfo.js#L295)）、managed/immutable 路径信息（[:297-303](file:///e:/newGsb/questions/GSB-013/Thor/lib/FileSystemInfo.js#L297-L303)）。
+
+1. **创建**：`createSnapshot(startTime, files, directories, missing, options, callback)`（[:2170](file:///e:/newGsb/questions/GSB-013/Thor/lib/FileSystemInfo.js#L2170)），`startTime` 由构建期传入。`checkManaged`（[:2265-2306](file:///e:/newGsb/questions/GSB-013/Thor/lib/FileSystemInfo.js#L2265-L2306)）把 managed/immutable 路径归入“假定不变”集合，正常校验时跳过——**若把频繁变化的路径误判进 managedPaths，会造成问题 A**。
+2. **校验**：`checkSnapshotValid(snapshot, callback)`（[:2729](file:///e:/newGsb/questions/GSB-013/Thor/lib/FileSystemInfo.js#L2729)）先查 `_snapshotCache`（同一 `FileSystemInfo` 内 memoize，[:2730-2739](file:///e:/newGsb/questions/GSB-013/Thor/lib/FileSystemInfo.js#L2730-L2739)），否则走 `_checkSnapshotValidNoCache`（[:2750](file:///e:/newGsb/questions/GSB-013/Thor/lib/FileSystemInfo.js#L2750)）。核心时间规则在 `checkFile`：**`if (typeof startTime === "number" && c.safeTime > startTime) return false;`**（[:2829](file:///e:/newGsb/questions/GSB-013/Thor/lib/FileSystemInfo.js#L2829)，目录版 [:2871](file:///e:/newGsb/questions/GSB-013/Thor/lib/FileSystemInfo.js#L2871)）——文件 `safeTime` 晚于 `startTime` 就判失效。`missingExistence` 的新建/删除通过 `checkExistence`（[:2803](file:///e:/newGsb/questions/GSB-013/Thor/lib/FileSystemInfo.js#L2803)）捕获。
+3. **startTime = `compiler.fsStartTime`**：`NormalModule.build` 用 `const startTime = compilation.compiler.fsStartTime || Date.now()`（[NormalModule.js:1198](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1198)）给本模块 snapshot 打时间戳；而 `fsStartTime` 正是 §10.1 `_go` 在读盘前设的（[Watching.js:121](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L121)）。**这条“读盘起点”是防止“构建途中被改的文件被当作已消化”的护栏**——构建期间（`safeTime > startTime`）改动的文件一律判失效，强制下一轮重建。
+4. **`needBuild` 决策阶梯**（[NormalModule.js:1540-1591](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1540-L1591)）：`_forceBuild`（[:1543](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1543)，由 `invalidateBuild()` [:1531-1533](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1531-L1533) 置位）→ `this.error` 重试 → `!cacheable`（[:1552](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1552)）→ `!snapshot`（[:1555](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1555)）→ `valueDependencies` 与 `valueCacheVersions` 比对（DefinePlugin 值变化，[:1558-1573](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1558-L1573)）→ **`fileSystemInfo.checkSnapshotValid(snapshot, ...)`**（[:1576](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1576)），失效即 `callback(null, true)` 重建。`build()` 末尾 `createSnapshot(...)` 存入 `buildInfo.snapshot`（[:1315-1329](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1315-L1329)）。`Compilation._buildModule` 正是在 build 前调 `module.needBuild(...)`（[Compilation.js:1500](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L1500)），返回 false 则跳过、触发 `stillValidModule`。
+5. **loader 额外登记的依赖**：loader 通过 `loaderContext.addDependency/addContextDependency/addMissingDependency`（由 loader-runner 实现，回填到 `result.fileDependencies` 等），在 `NormalModule.build` 里 `fileDependencies.addAll(result.fileDependencies)`（[NormalModule.js:1073-1075](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1073-L1075)）并进入该模块 snapshot；loader 本身路径与 `addBuildDependency`（[:810-817](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L810-L817)）进 `buildInfo.buildDependencies`。**loader 忘记 `addDependency` 是问题 A 的经典根因**：读了某文件却没登记，snapshot 不含它，改它不触发重建。
+6. **四类依赖聚合与去向**：`Compilation` 构造四个 `LazySet`：`fileDependencies`/`contextDependencies`/`missingDependencies`/`buildDependencies`（[Compilation.js:1183-1189](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L1183-L1189)）。`summarizeDependencies()`（[:4203](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L4203)，seal 中 [:3384](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L3384) 调用）合并子编译并对每模块 `addCacheDependencies`。前三者 → §10.2 重挂 watcher；`buildDependencies` → §10.4 持久化缓存整体校验。
+
+### 10.4 `CacheFacade` identifier/etag 与 `PackFileCacheStrategy`：持久化缓存整体复用
+
+**CacheFacade 的 identifier/etag 模型**（[CacheFacade.js](file:///e:/newGsb/questions/GSB-013/Thor/lib/CacheFacade.js)）：identifier 是带 name 前缀的字符串（`getItemCache` 拼 `${this._name}|${identifier}`，[:225-231](file:///e:/newGsb/questions/GSB-013/Thor/lib/CacheFacade.js#L225-L231)）；etag 由 `getLazyHashedEtag(obj)`（[:237-239](file:///e:/newGsb/questions/GSB-013/Thor/lib/CacheFacade.js#L237-L239)，其 `toString()` 惰性算 `obj.updateHash` 的 hash）或 `mergeEtags`（[:246-248](file:///e:/newGsb/questions/GSB-013/Thor/lib/CacheFacade.js#L246-L248)，`"a|b"`）产生；`provide/providePromise`（[:318-345](file:///e:/newGsb/questions/GSB-013/Thor/lib/CacheFacade.js#L318-L345)）= get-else-compute-then-store。
+
+具体用法在 `Compilation`：模块缓存 `_modulesCache = getCache("Compilation/modules")`（[Compilation.js:1203](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L1203)）用 **etag=null**，靠 snapshot 判有效（[:1433](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L1433)/[:1536](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L1536)）；**代码生成缓存**用真 etag：`_codeGenerationModule` 以 identifier `${module.identifier()}|${runtimeKey}`、etag `${hash}|${dependencyTemplates.getHash()}`（[:3639-3640](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L3639-L3640)）。**结论：watch 下复用一个模块的产物，需要同时满足 (a) snapshot 仍有效（不重建）与 (b) codegen etag 不变（不重生成）**。
+
+**IdleFileCachePlugin**（[IdleFileCachePlugin.js](file:///e:/newGsb/questions/GSB-013/Thor/lib/cache/IdleFileCachePlugin.js)）在 `STAGE_DISK` tap `cache.hooks.store`（不立刻写，入 `pendingIdleTasks` 队列，[:58-65](file:///e:/newGsb/questions/GSB-013/Thor/lib/cache/IdleFileCachePlugin.js#L58-L65)）、`get`（先跑挂起的同 id store 再 `strategy.restore`，[:67-92](file:///e:/newGsb/questions/GSB-013/Thor/lib/cache/IdleFileCachePlugin.js#L67-L92)）、`beginIdle`（起定时器，[:178-218](file:///e:/newGsb/questions/GSB-013/Thor/lib/cache/IdleFileCachePlugin.js#L178-L218)）、`processIdleTasks`（空闲时把 pack 落盘，`strategy.afterAllStored()`，[:137-175](file:///e:/newGsb/questions/GSB-013/Thor/lib/cache/IdleFileCachePlugin.js#L137-L175)）。**因此 `cache.beginIdle()`（§10.2 收尾）才是持久化真正落盘的触发点**——进程若在 idle 前退出，缓存可能未写全。
+
+**PackFileCacheStrategy**（[PackFileCacheStrategy.js](file:///e:/newGsb/questions/GSB-013/Thor/lib/cache/PackFileCacheStrategy.js)）：
+- 构造持有 `fileSystemInfo`、`version`（salt，[:1109](file:///e:/newGsb/questions/GSB-013/Thor/lib/cache/PackFileCacheStrategy.js#L1109)）、`buildDependencies`/`newBuildDependencies`、`buildSnapshot`/`resolveBuildDependenciesSnapshot`/`resolveResults`（[:1080-1136](file:///e:/newGsb/questions/GSB-013/Thor/lib/cache/PackFileCacheStrategy.js#L1080-L1136)）。
+- `store`/`restore` 把 etag `toString()` 后交给内存 Pack；`Pack.get` **etag 不匹配返回 `null`（stale）**（[:167](file:///e:/newGsb/questions/GSB-013/Thor/lib/cache/PackFileCacheStrategy.js#L167)）。
+- **整体作废条件**（`_openPack` 恢复时，[:1151-1309](file:///e:/newGsb/questions/GSB-013/Thor/lib/cache/PackFileCacheStrategy.js#L1151-L1309)）：① `packContainer.version !== version` 直接丢弃（[:1197-1202](file:///e:/newGsb/questions/GSB-013/Thor/lib/cache/PackFileCacheStrategy.js#L1197-L1202)）；② `checkSnapshotValid(buildSnapshot)` 失败（build 依赖变了，[:1206-1225](file:///e:/newGsb/questions/GSB-013/Thor/lib/cache/PackFileCacheStrategy.js#L1206-L1225)）；③ resolve 快照失败且 `checkResolveResultsValid` 也不过（[:1228-1268](file:///e:/newGsb/questions/GSB-013/Thor/lib/cache/PackFileCacheStrategy.js#L1228-L1268)）。只有 build 与 resolve 都有效才加载旧 pack，否则返回空 Pack。
+- `afterAllStored`（[:1353-1534](file:///e:/newGsb/questions/GSB-013/Thor/lib/cache/PackFileCacheStrategy.js#L1353-L1534)）用 `fileSystemInfo.resolveBuildDependencies` + `createSnapshot` 生成 build/resolve 快照并写回 `PackContainer(pack, version, buildSnapshot, ...)`。
+
+**build dependencies vs file/context/missing dependencies 的区别**：前者描述“**如何构建**”（loader 模块、config、webpack 自身），由 `resolveBuildDependencies` 单独解析、用独立快照校验，**一旦变化作废整个持久化缓存**（问题 B 的合理来源）；后者描述“**构建的输入**”，进单模块 snapshot，只影响该模块是否重建。`version` salt 变化（webpack 版本/配置指纹，构造于本文件上游，**未证实**其精确组成）同样整体作废——这是升级 webpack 或改配置后“整轮重做”的正常表现。
+
+### 10.5 判定表：可安全复用 / 必须重建或重解析 / 只需重新生成或写出
+
+> 说明：以下按“单模块”视角给出主判据与源码依据。“重解析”指重跑 loader+parser 从而可能改变 ModuleGraph 的出边；“重生成”指模块不重建但 code generation 结果因 etag 变化而重算；“重写盘”指 assets 变化后 `emitAssets` 实际写出。
+
+| 变化类型 | Watching 层 | needBuild / snapshot 层 | 持久化缓存层 | 判定结果 | 主要依据 |
+| --- | --- | --- | --- | --- | --- |
+| **普通源码文件改动**（模块自身或已登记的 fileDependency） | `modifiedFiles` 含它，触发新一轮 | `checkSnapshotValid` 失效（timestamp/hash 变或 `safeTime>startTime`） | 该模块 codegen etag（hash）变 | **必须重建 + 重解析**该模块；下游依赖按图重连；其余模块复用 | [FileSystemInfo.js:2829](file:///e:/newGsb/questions/GSB-013/Thor/lib/FileSystemInfo.js#L2829)、[NormalModule.js:1576](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1576) |
+| **仅下游 chunk 归属/ID 变化，模块源码未变** | 可能因别处改动触发一轮 | snapshot 仍有效 → **不重建** | codegen etag 含 `hash`，随 chunk/hash 变而变 | **只需重新生成 + 重写出资产**（模块本身复用） | [Compilation.js:3639-3640](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L3639-L3640) |
+| **loader 额外登记的依赖变化**（正确 `addDependency`） | 该依赖在上一轮进了 `compilation.fileDependencies` → watcher 监听 → 触发 | 该依赖在模块 snapshot 内 → `checkSnapshotValid` 失效 | 同源码改动 | **必须重建 + 重解析**该模块 | [NormalModule.js:1073-1075](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1073-L1075)、[:1315-1321](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1315-L1321) |
+| **loader 读了却未登记依赖**（缺 `addDependency`） | 该文件不在 watcher 列表 → **不触发** | 即便触发，snapshot 也不含它 → 判有效 | — | **错误复用（问题 A）**；根因是依赖未登记，非缓存 bug | 反证：[Watching.js:329-340](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L329-L340) 只监听 compilation 汇总的依赖 |
+| **缺失依赖出现**（原先 import 的文件从无到有） | 该路径作为 missingDependency 被监听 → 触发 | snapshot 的 `missingExistence` 经 `checkExistence` 判失效 | 重建后重新解析该 import | **必须重建 + 重解析**（可能新增图节点/新 async chunk） | [FileSystemInfo.js:2803](file:///e:/newGsb/questions/GSB-013/Thor/lib/FileSystemInfo.js#L2803)、[:295](file:///e:/newGsb/questions/GSB-013/Thor/lib/FileSystemInfo.js#L295) |
+| **build 依赖 / 配置 / webpack 版本变化** | 下一轮照常 | 单模块 snapshot 未必变 | `checkSnapshotValid(buildSnapshot)` 失败或 `version` 不匹配 → **丢弃整个 pack** | **整轮重建**（持久化缓存全失效，问题 B 的合理表现） | [PackFileCacheStrategy.js:1197-1202](file:///e:/newGsb/questions/GSB-013/Thor/lib/cache/PackFileCacheStrategy.js#L1197-L1202)、[:1206-1225](file:///e:/newGsb/questions/GSB-013/Thor/lib/cache/PackFileCacheStrategy.js#L1206-L1225) |
+| **构建过程中再次 invalid** | running 时只置 `invalid=true` 并合并 collected（[:431-433](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L431-L433)），`_done` 再失效分支直接 `_go`（[:281-298](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L281-L298)） | 构建期改动因 `safeTime>startTime` 在**下一轮**判失效 | — | **本轮完成后立即再跑一轮**；受影响文件下一轮重建（避免用到途中被改内容） | [Watching.js:431-433](file:///e:/newGsb/questions/GSB-013/Thor/lib/Watching.js#L431-L433)、[FileSystemInfo.js:2829](file:///e:/newGsb/questions/GSB-013/Thor/lib/FileSystemInfo.js#L2829) |
+| **managed/immutable 路径下的文件改动** | 取决于 watcher 是否覆盖 | `checkManaged` 归入“假定不变” → 正常校验跳过 | managed 项由 `managedItemInfo`（版本）判定 | **默认复用**；若误配 managedPaths 会导致**错误复用（问题 A）** | [FileSystemInfo.js:2265-2306](file:///e:/newGsb/questions/GSB-013/Thor/lib/FileSystemInfo.js#L2265-L2306) |
+
+**排查口诀**：
+- 命中问题 **A（stale）**：先看该文件是否在 `compilation.fileDependencies/contextDependencies/missingDependencies`（决定是否被监听）→ 再看是否落入该模块的 snapshot（决定 `checkSnapshotValid` 是否管它）→ 再排除 managedPaths/immutablePaths 误配。多为**依赖未登记**或**managedPaths 误配**，而非缓存核心逻辑错误。
+- 命中问题 **B（over-rebuild）**：先看是否 build 依赖/`version` 触发了整 pack 作废（`_openPack` 的丢弃分支）→ 再看是否非绝对路径依赖（[NormalModule.js:1262-1312](file:///e:/newGsb/questions/GSB-013/Thor/lib/NormalModule.js#L1262-L1312) 会 warn）导致 snapshot 反复失效 → 再看是否有 `safeTime>startTime` 的写入型 loader 造成每轮自失效。
+
+---
+
 ## 9. 待核实 / 未证实清单（后续深入方向）
 
 以下为**未直接读源确认**的点，标为 **未证实**，避免误导：
 
 - **未证实**：`SplitChunksPlugin` 在 `optimizeChunks` 阶段抽取共享模块（把 §8.3 中被复制的 `shared` 提成独立 chunk）的具体判据（`minChunks`/`minSize`/`cacheGroups`）尚未逐行读。
 - **未证实**：`runtimeChunk` 选项如何决定 runtime code 落在独立 runtime chunk 还是并入 entry chunk（§8.5 里 `addRuntimeModule` 的目标 chunk 选择）。
-- **未证实**：文件系统缓存（`cache.type === "filesystem"`）在 `WebpackOptionsApply` 中所装插件（`IdleFileCachePlugin` / `PackFileCacheStrategy` 等）的序列化与失效判定流程。
+- **未证实**：`PackFileCacheStrategy` 的 `version`/salt 精确由哪些输入（webpack 版本、config 指纹、`cache.version` 等）在**本文件上游**如何拼成，尚未逐行确认。
+- **未证实**：loader 侧 `addDependency`/`addMissingDependency` 的实现细节在 `loader-runner` 包内（本 checkout 未包含其源码），无法给出行号。
 - **未证实**：`MultiCompiler`（[lib/MultiCompiler.js](file:///e:/newGsb/questions/GSB-013/Thor/lib/MultiCompiler.js)）如何按 `setDependencies` 调度子 compiler 的先后与并行。
 - **未证实**：`module.build` / `module.codeGeneration` 在 `NormalModule` 中的 loader 执行与 parser（`JavascriptParser`）AST 遍历细节。
 
