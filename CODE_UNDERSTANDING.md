@@ -1,6 +1,6 @@
-# Webpack 构建基础设施第一版理解
+# Webpack 构建基础设施理解（事故复盘一致版本）
 
-本文基于当前仓库 `webpack@5.99.9` 的源码阅读，记录从外部 `webpack()` 调用进入一次非 watch 构建，到配置规范化、`Compiler` 创建、插件应用、模块图构建、`Compilation.seal()`、代码生成和资源写出的主链路。
+本文基于当前仓库 `webpack@5.99.9` 的源码阅读，按事故复盘需要串联 public API、`Compiler`、`Compilation`、loader/factory、模块图、chunk/runtime、watch、filesystem cache 和持久化复用。文中明确区分已由源码证实的调用顺序、对象所有权和未逐行展开的实现细节。
 
 后续沿用以下三个执行域名称：
 
@@ -464,7 +464,7 @@ loader 相关的 compilation hook 在 [NormalModule.getCompilationHooks](file://
 - 每个 loader 在 pitch 阶段可以读写 `loaderContext.loaders`；
 - `loaderContext.remainingRequest`、`previousRequest`、`currentRequest`、`resourcePath`、`resourceQuery`、`resourceFragment` 会随当前 loaderIndex 变化。
 
-为什么 normal 阶段反向执行？因为 pipeline 的输入输出是嵌套的：最左侧 pre loader 应当最先看到最终资源处理结果，并在最后输出给 webpack；post loader 最靠近原始资源读取结果，因此先执行 normal 处理。webpack 中最终结果由 loaderIndex 0 对应的 loader（数组最左侧）返回给 webpack，这与 [processResult 检查 final loader](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L953-L965) 一致。
+为什么 normal 阶段反向执行？因为 pipeline 是嵌套的：pitch 从数组左侧先获得控制权，normal 从最右侧 loader 开始逐层把资源交给左侧 loader；最终由 loaderIndex 0（数组最左侧）把结果返回给 webpack。在 webpack 的最终数组里，最左侧是 post loader，因此 post loader 的 normal 阶段最后执行并把结果交给 webpack，这与 [processResult 检查 final loader](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L953-L965) 一致。
 
 若某 pitch loader 向 `callback` 返回非空内容，loader-runner 会把该内容作为该位置结果，跳过其右侧 loaders 的 normal 执行，也跳过对剩余 resource 的读取；具体实现属于 loader-runner 包，当前仓库未包含其源码，标为“实现来自 loader-runner，按 webpack 类型和 runLoaders 调用点确认”。在 webpack 侧能确认的是：runLoaders 返回的 result 直接经 `processResult` 进入 NormalModule；若没有 result，`buildInfo.cacheable` 会被置 false 并报 `No result from loader-runner processing`，见 [NormalModule.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L1043-L1059)。
 
@@ -727,7 +727,22 @@ __webpack_require__.e(/* import() */ <asyncChunkId>).then(__webpack_require__.bi
 - 相同 `webpackChunkName` 的异步 block 会复用同名 `ChunkGroup`；复用 initial group 会报 `AsyncDependencyToInitialChunkError`，见 [buildChunkGraph.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/buildChunkGraph.js#L580-L630)。
 - 若 `webpackMode: "eager"`，parser 不创建 `AsyncDependenciesBlock`，而是生成 `ImportEagerDependency`，因此不会产生按需 chunk；见 [ImportParserPlugin.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/dependencies/ImportParserPlugin.js#L265-L273)。
 - 若 `webpackMode: "weak"`，parser 使用 `ImportWeakDependency` 且也不创建异步 block；见 [ImportParserPlugin.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/dependencies/ImportParserPlugin.js#L273-L281)。
-- `splitChunks`、`runtimeChunk`、module concatenation、usedExports/providedExports 等优化可能在 `seal()` 后续 hooks 中改变 chunk 成员和生成代码；本文确认的是它们的 hook 插槽，具体每个优化插件的行为列入未证实范围或需后续单独展开。
+- `runtimeChunk`、module concatenation、usedExports/providedExports 等优化也可能在 `seal()` 后续 hooks 中改变 chunk 成员和生成代码；其中 `SplitChunksPlugin` 的关键改写见 5.8，其他优化插件仍需单独展开。
+
+
+### 5.8 `splitChunks` 如何改写共享模块的 chunk 归属
+
+[SplitChunksPlugin.apply](file:///e:/newGsb/questions/GSB-013/Tony/lib/optimize/SplitChunksPlugin.js#L822-L840) 在 `thisCompilation` 中注册，并在 `compilation.hooks.optimizeChunks` 的 `STAGE_ADVANCED` 执行。因此它发生在 [buildChunkGraph](file:///e:/newGsb/questions/GSB-013/Tony/lib/buildChunkGraph.js#L1301-L1357) 建立初始 chunk graph 之后、code generation 之前。
+
+已证实的关键动作是：
+
+- 插件遍历模块和模块所在 chunks，通过 `getCacheGroups(module, { moduleGraph, chunkGraph })` 取得 cache groups，见 [SplitChunksPlugin.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/optimize/SplitChunksPlugin.js#L1240-L1291)。
+- 满足 `minChunks`、`minSize`、request 限制等条件的模块集合会形成候选 chunk info，见 [SplitChunksPlugin.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/optimize/SplitChunksPlugin.js#L1131-L1364)。
+- 生成 chunk 时，可以按 name 复用 `compilation.namedChunks`，也可以按 `reuseExistingChunk` 复用已有 chunk；否则 `compilation.addChunk()` 创建新 chunk，见 [SplitChunksPlugin.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/optimize/SplitChunksPlugin.js#L1394-L1547)。
+- 对每个源 chunk 调 [Chunk.split](file:///e:/newGsb/questions/GSB-013/Tony/lib/Chunk.js#L542-L551)，它把新 chunk 插入该 chunk 所属的所有 chunk groups，并合并 runtime。
+- 随后通过 `chunkGraph.connectChunkAndModule(newChunk, module)` 和 `chunkGraph.disconnectChunkAndModule(chunk, module)` 移动模块，见 [SplitChunksPlugin.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/optimize/SplitChunksPlugin.js#L1572-L1589)。
+
+因此，5.1 到 5.7 描述的是 `buildChunkGraph` 后的初始图；若配置命中 splitChunks cache group，被两个入口共享的 `shared` 可以从两个 initial chunk 移到一个共享 initial chunk。它不改变 `ModuleGraph` 中 `entry-a -> shared`、`entry-b -> shared` 的 connection，只改变 `ChunkGraph` 中模块属于哪些 chunk，以及 chunk group 中 chunk 的顺序。动态 import 仍以前文 `AsyncDependenciesBlock -> ChunkGroup` 为边界；如果异步目标模块已经在父级可用模块集合中，仍不会重复放入异步 chunk。
 
 
 ## 6. 写入产物的 runtime 如何形成
@@ -756,7 +771,7 @@ JavaScript 渲染由 [JavascriptModulesPlugin](file:///e:/newGsb/questions/GSB-0
 
 前几节的 `Compiler`、`Compilation`、parser、`ModuleGraph`、`ChunkGraph` 和 emitted runtime 都属于单次构建中的对象。watch/cache 域要解决的是：这些对象在下一轮构建里哪些能跨轮保留，哪些必须重新解析、重新建图、重新生成或重新写出。
 
-### 6.1 invalidation 从文件事件到新 compile
+### 7.1 invalidation 从文件事件到新 compile
 
 watch 模式下，[Watching](file:///e:/newGsb/questions/GSB-013/Tony/lib/Watching.js) 并不直接持有原生文件句柄；它通过 `compiler.watchFileSystem.watch()` 委托给 [NodeWatchFileSystem](file:///e:/newGsb/questions/GSB-013/Tony/lib/node/NodeWatchFileSystem.js#L30-L189)。每次 `Watching.watch()` 都：
 
@@ -784,7 +799,7 @@ watch 模式下，[Watching](file:///e:/newGsb/questions/GSB-013/Tony/lib/Watchi
 
 编译运行中再次 invalid 时，[Watching._done](file:///e:/newGsb/questions/GSB-013/Tony/lib/Watching.js#L281-L345) 会在 store build dependencies 前检查 `this.invalid`；若已失效，当前 compilation 的结果不会走用户 handler/done 汇报，而是直接重新 `_go()`。这会形成“正在 emit 或 done 前又改文件，当前轮结果被丢弃”的行为。
 
-### 6.2 依赖集合和 snapshot：watch 保存的事实
+### 7.2 依赖集合和 snapshot：watch 保存的事实
 
 `Compilation` 在构造时创建四类集合，见 [Compilation.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compilation.js#L1183-L1189)：
 
@@ -826,7 +841,7 @@ Snapshot 校验的关键比较在 [FileSystemInfo.js](file:///e:/newGsb/question
 
 safeTime/startTime 是避免 timestamp race 的关键：当前条目的 `safeTime` 晚于 snapshot startTime 时，FileSystemInfo 认为它可能在读取后变化，从而判定 invalid；见 [checkFile](file:///e:/newGsb/questions/GSB-013/Tony/lib/FileSystemInfo.js#L2824-L2858) 和 [checkContext](file:///e:/newGsb/questions/GSB-013/Tony/lib/FileSystemInfo.js#L2866-L2903)。
 
-### 6.3 从模块到 compilation：依赖如何进入下一轮 watch
+### 7.3 从模块到 compilation：依赖如何进入下一轮 watch
 
 `Compilation.seal()` 接近完成时调用 [summarizeDependencies](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compilation.js#L4203-L4219)：
 
@@ -850,7 +865,7 @@ safeTime/startTime 是避免 timestamp race 的关键：当前条目的 `safeTim
 
 “什么都没改却整轮重做”的常见原因之一，是目录 context 或 missing path 的 timestamp/hash 被外部工具刷新、snapshot safeTime 判定保守、或者 buildDependencies 被改变；这时即使源码内容没变，snapshot/value dependency 也可能判定需要 rebuild。
 
-### 6.4 `CacheFacade` identifier/etag：编译期对象复用的 key
+### 7.4 `CacheFacade` identifier/etag：编译期对象复用的 key
 
 每次 `Compiler.compile()` 新建 [Compilation](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compilation.js#L993-L1209)，但它通过 [Compiler.getCache](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compiler.js#L327-L337) 获得带前缀的 [CacheFacade](file:///e:/newGsb/questions/GSB-013/Tony/lib/CacheFacade.js#L196-L300)。CacheFacade 把：
 
@@ -875,7 +890,7 @@ Compilation 中有三层最直接相关的 cache：
 - module/chunk/runtime/template/content hash 没变，asset `Source` 可复用；
 - 即使 `Source` 复用，`Compiler.emitAssets()` 仍会根据磁盘状态、`compareBeforeEmit`、immutable 信息决定是否写盘；见第一版资源写出链路和 [Compiler.emitAssets](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compiler.js#L676-L1021)。
 
-### 6.5 filesystem pack cache：保存和验证的事实
+### 7.5 filesystem pack cache：保存和验证的事实
 
 filesystem cache 由 `cache.type: "filesystem"` 的策略接入。核心类是 [PackFileCacheStrategy](file:///e:/newGsb/questions/GSB-013/Tony/lib/cache/PackFileCacheStrategy.js#L1064-L1547)，它把大量 CacheFacade item 存储到 pack content 中，并用一个 [PackContainer](file:///e:/newGsb/questions/GSB-013/Tony/lib/cache/PackFileCacheStrategy.js#L37-L86) 保存元事实：
 
@@ -908,7 +923,7 @@ item 读取走 [restore](file:///e:/newGsb/questions/GSB-013/Tony/lib/cache/Pack
 
 [IdleFileCachePlugin](file:///e:/newGsb/questions/GSB-013/Tony/lib/cache/IdleFileCachePlugin.js#L178-L228) 负责 idle 调度：beginIdle 后等待 idle timeout，再分批执行 pending tasks，之后 `afterAllStored()`；新一轮编译开始时 `endIdle` 会取消 timer。因此“文件改了但磁盘 cache 仍旧结果”的排查还要区分：是 memory item 命中、disk pack 恢复成功，还是 buildDependencies snapshot 没有覆盖真正的配置/loader 变化。
 
-### 6.6 失效边界与判定表
+### 7.6 失效边界与判定表
 
 | 变化类型 | watch/snapshot 如何发现 | 模块解析/构建图 | Code generation | Asset/写出 | 主要依据 |
 |---|---|---|---|---|---|
@@ -921,7 +936,7 @@ item 读取走 [restore](file:///e:/newGsb/questions/GSB-013/Tony/lib/cache/Pack
 | 只有未影响 module hash/dep template hash 的内部变化 | 可能 rebuild，但如果 hash 结果一致 | 依赖或内部数据可能更新，但 codegen etag 仍匹配 | code generation result 可从 cache 复用 | 若 manifest identifier/content hash 不变，asset `Source` 可复用；写盘仍由 emit 比较逻辑决定 | [code generation cache](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compilation.js#L3636-L3644), [asset cache](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compilation.js#L4951-L5052) |
 | 输出 asset 内容没变但磁盘文件被删或 mtime 变化 | 这不是 module snapshot 问题，而是 emit 阶段状态问题 | 不需要重新建图 | 不需要重新 codegen，可复用内存 asset source | `emitAssets()` 根据 stat/readFile/immutable/compareBeforeEmit 判断是否重新 writeFile | [Compiler.emitAssets](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compiler.js#L893-L982) |
 
-### 6.7 两类问题的排查顺序
+### 7.7 两类问题的排查顺序
 
 **“文件改了却复用旧结果”优先检查：**
 
@@ -941,7 +956,113 @@ item 读取走 [restore](file:///e:/newGsb/questions/GSB-013/Tony/lib/cache/Pack
 5. 插件是否在 `watchRun`、`normalModuleFactory`、`needBuild` 等 hook 中强制 invalidate 或修改 value cache versions；
 6. 是否是编译中连续保存触发 `Watching.invalid`，导致上一轮结果被丢弃。这不是复用错误，而是调度层主动重编译。
 
-## 8. hook 短路、异步边界和多轮编译要点
+## 8. 事故复盘场景：多 entry、共享依赖、动态 import、splitChunks、filesystem cache、watch
+
+为了让前述链路可用于复盘，固定一个确定性配置场景（这里是说明，不是仓库中的实际配置文件）：
+
+- `entry.app = "./src/app.js"`，`entry.admin = "./src/admin.js"`。
+- `app.js` 和 `admin.js` 都静态 `import "./shared"`。
+- `app.js` 还调用普通动态 `import("./lazy")`。
+- 一个自定义 loader 处理 `*.component.html`；该 loader 通过 `this.addDependency(externalFile)` 登记外部数据文件。
+- `optimization.splitChunks.cacheGroups.shared` 明确配置为 `chunks: "all"`、`name: "shared"`、`minChunks: 2`、`enforce: true`，用于把 `shared.js` 抽成初始共享 chunk。
+- `cache.type = "filesystem"`，`cache.cacheLocation` 固定，`cache.buildDependencies.config` 包含 webpack 配置和自定义 loader；未额外配置 `optimization.runtimeChunk`。
+
+### 8.1 冷启动构建与首次写出
+
+1. **public API 到 Compiler。** `webpack(options)` 经 [webpack.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/webpack.js#L121-L193) 规范化配置、创建 [Compiler](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compiler.js#L137-L325)，再由 [WebpackOptionsApply](file:///e:/newGsb/questions/GSB-013/Tony/lib/WebpackOptionsApply.js#L78-L793) 注册内建插件。这里创建的是长期存在的 compiler；watch/cache 都挂在它上面。
+2. **compile 创建当次图对象。** [Compiler.compile](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compiler.js#L1310-L1355) 为当次构建创建 `NormalModuleFactory`、`ContextModuleFactory` 和新的 `Compilation`。[Compilation](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compilation.js#L993-L1209) 持有新的 [ModuleGraph](file:///e:/newGsb/questions/GSB-013/Tony/lib/ModuleGraph.js#L128-L161)，但 `ChunkGraph` 要到 seal 才创建。
+3. **入口和模块 factory。** [EntryPlugin](file:///e:/newGsb/questions/GSB-013/Tony/lib/EntryPlugin.js#L33-L52) 在 `make` 中 `addEntry()`，随后进入 [handleModuleCreation](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compilation.js#L1935-L2072) 的 factorize/add/build/processDependencies 队列。普通模块由 [NormalModuleFactory.create](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModuleFactory.js#L869-L953) 解析 request、resource、rules 和 loaders，再创建 [NormalModule](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L337-L380)。
+4. **首次 build。** 冷启动时模块通常没有有效 snapshot，[needBuild](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L1540-L1592) 返回 true。[NormalModule.build](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L1175-L1370) 清空旧状态后调用 loader-runner；自定义 loader 读取外部文件时必须调用 `addDependency`，否则该外部文件不会进入 snapshot。parser 为静态 import 生成 Harmony dependencies，为动态 `import("./lazy")` 生成 `AsyncDependenciesBlock` 和 `ImportDependency`。
+5. **ModuleGraph。** `_processModuleDependencies()` 遍历 dependencies/blocks，调用 [ModuleGraph.setResolvedModule](file:///e:/newGsb/questions/GSB-013/Tony/lib/ModuleGraph.js#L213-L243) 建边。此时图中有 `app -> shared`、`admin -> shared`、`app -> async block -> lazy` 等关系。
+6. **初始 ChunkGraph。** `seal()` 创建 [ChunkGraph](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compilation.js#L3062-L3072)，并由 [buildChunkGraph](file:///e:/newGsb/questions/GSB-013/Tony/lib/buildChunkGraph.js#L1301-L1357) 为 app/admin 创建 initial chunks，为 lazy 创建 async chunk group。若没有 splitChunks，`shared` 会在两个 initial chunks 中；本场景配置了 splitChunks，下一步会改写它。
+7. **splitChunks 改写。** [SplitChunksPlugin](file:///e:/newGsb/questions/GSB-013/Tony/lib/optimize/SplitChunksPlugin.js#L822-L840) 在 `optimizeChunks` STAGE_ADVANCED 运行，把满足 cache group 的 `shared` 移到名为 `shared` 的新 initial chunk；[Chunk.split](file:///e:/newGsb/questions/GSB-013/Tony/lib/Chunk.js#L542-L551) 把该 chunk 插入 app/admin 的 chunk groups，然后 [connect/disconnect](file:///e:/newGsb/questions/GSB-013/Tony/lib/optimize/SplitChunksPlugin.js#L1572-L1589) 修改 ChunkGraph。
+8. **codegen 和 runtime。** [codeGeneration](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compilation.js#L3467-L3681) 按 module/runtime 生成 `Source`；静态 import 被翻译为 harmony import/`__webpack_require__`，动态 import 由 [ImportDependency.Template](file:///e:/newGsb/questions/GSB-013/Tony/lib/dependencies/ImportDependency.js#L107-L137) 调 [RuntimeTemplate.moduleNamespacePromise](file:///e:/newGsb/questions/GSB-013/Tony/lib/RuntimeTemplate.js#L602-L739)，进一步通过 [blockPromise](file:///e:/newGsb/questions/GSB-013/Tony/lib/RuntimeTemplate.js#L986-L1042) 生成 `__webpack_require__.e(lazyId)`。[RuntimePlugin](file:///e:/newGsb/questions/GSB-013/Tony/lib/RuntimePlugin.js#L371-L383) 根据 `ensureChunk` requirement 添加 [EnsureChunkRuntimeModule](file:///e:/newGsb/questions/GSB-013/Tony/lib/runtime/EnsureChunkRuntimeModule.js#L26-L65)。
+9. **assets 与首次写出。** [createChunkAssets](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compilation.js#L4914-L5070) 生成内存 assets；[Compiler.emitAssets](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compiler.js#L676-L1021) 写磁盘。默认 `output.compareBeforeEmit` 为 true，见 [defaults.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/config/defaults.js#L1148-L1148)，因此内容未变的输出文件可跳过 writeFile。
+10. **watch 与持久化。** 成功后 [summarizeDependencies](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compilation.js#L4203-L4219) 汇总 file/context/missing/build dependencies；[Watching._done](file:///e:/newGsb/questions/GSB-013/Tony/lib/Watching.js#L303-L345) 调 `cache.storeBuildDependencies`，并用 file/context/missing dependencies 重新 watch。idle 后 [IdleFileCachePlugin](file:///e:/newGsb/questions/GSB-013/Tony/lib/cache/IdleFileCachePlugin.js#L178-L228) 触发 [PackFileCacheStrategy.afterAllStored](file:///e:/newGsb/questions/GSB-013/Tony/lib/cache/PackFileCacheStrategy.js#L1353-L1534)，把 pack、version、buildSnapshot 和 item etags 写入 cacheLocation。
+
+### 8.2 watch 中入口源码变化
+
+当 `app.js` 变化：
+
+- Watchpack aggregated 后，[NodeWatchFileSystem](file:///e:/newGsb/questions/GSB-013/Tony/lib/node/NodeWatchFileSystem.js#L78-L109) purge 相关缓存并回传 changes/removals；[Watching._invalidate](file:///e:/newGsb/questions/GSB-013/Tony/lib/Watching.js#L420-L442) 在未运行时进入 `_go()`。
+- `app.js` 已在 `fileDependencies` 中，[FileSystemInfo.checkSnapshotValid](file:///e:/newGsb/questions/GSB-013/Tony/lib/FileSystemInfo.js#L2803-L3249) 判定 snapshot 失效，[NormalModule.needBuild](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L1540-L1592) 返回 true。
+- `app` 模块 rebuild 时会 [clearDependenciesAndBlocks](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L1180-L1184)，因此旧 dependency/block 不会残留；重新 parse 后生成新的 Harmony dependency 和新的 `AsyncDependenciesBlock`。
+- `shared`、`lazy` 若自身 snapshot 有效，则不重新跑 loader/parser；它们的 Module 对象和 buildInfo 可复用于当次 Compilation。图关系仍由 `app` 的新 dependencies 重新连接。
+- SplitChunksPlugin 重新运行；若 import 关系未变，`shared` 仍移动到 `shared` initial chunk，`lazy` 仍是 async chunk。
+- `app` 的 module hash 改变，使 [code generation cache](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compilation.js#L3636-L3644) etag 失效；`shared`、`lazy` 的 codegen etag 不变时可复用。asset cache 以 [render manifest hash](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compilation.js#L4951-L5052) 判定，app asset 重新 render，未变 chunk asset 可复用 `Source`。
+- emit 阶段默认 compareBeforeEmit，因此未变的 shared/lazy/runtime 文件可能不重写；变化的 app 文件会写盘。
+
+### 8.3 loader 登记的外部文件变化
+
+如果自定义 loader 正确调用 `this.addDependency(externalFile)`：
+
+- `externalFile` 进入 loader-runner 返回的 `result.fileDependencies`，随后被 [NormalModule._doBuild](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L1063-L1083) 加入 `buildInfo.fileDependencies`，再经 [createSnapshot](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L1314-L1332) 保存。
+- 即使 `app.js` 本身没变，`externalFile` 的 timestamp/hash/existence 变化也会让 snapshot 失效，`app` rebuild，loader 重新执行。
+- rebuild 后如果生成内容和 dependency graph 与上一轮一致，模块仍可能重新构建但 codegen/asset etag 不变，从而复用后续产物；这是“重建但不重写资产”的正常分层。
+
+如果 loader 没有调用 `addDependency`：
+
+- `externalFile` 不在 `fileDependencies` 或 snapshot 中；Watchpack 也不会监听它。
+- `app` 的 snapshot 可能继续有效，[stillValidModule](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compilation.js#L1519-L1526) 复用旧模块，旧 source/AST/dependency 会继续参与图和代码生成。
+- 这正是“文件改了却复用旧结果”的典型 loader 边界问题。它不是 ChunkGraph 或 runtime 复用，而是模块 build 失效事实缺失。
+
+### 8.4 构建过程中再次 invalid
+
+若文件在一次编译运行中再次变化：
+
+- [Watching._invalidate](file:///e:/newGsb/questions/GSB-013/Tony/lib/Watching.js#L431-L434) 不重入 `compile()`，只合并 changed/removed 并设置 `this.invalid = true`。
+- 当前 Compilation 可能已经走完 build、seal、codegen，甚至已经进入或完成 [emitAssets](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compiler.js#L676-L1021)；webpack 不会仅因 `invalid` 标志在中途停止当前 emit。
+- [Watching._done](file:///e:/newGsb/questions/GSB-013/Tony/lib/Watching.js#L281-L300) 在汇报用户 callback/done 前检查 `invalid`；若已失效，它不会汇报当前 Stats，而是立即再次 `_go()`。
+- 因此事故现象可能是：磁盘上出现了当前轮写出的文件，但用户没有收到对应 Stats，下一轮编译很快又覆盖它们。这属于 watch 调度层的“丢弃结果”，不是文件缓存错误。
+
+### 8.5 下一次重启命中持久缓存
+
+进程重启后：
+
+- compiler 仍是同一套配置，但每次 [Compiler.compile](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compiler.js#L1310-L1355) 仍会创建新的 NormalModuleFactory 和 Compilation。
+- filesystem cache 插件在编译早期恢复 [PackFileCacheStrategy](file:///e:/newGsb/questions/GSB-013/Tony/lib/cache/PackFileCacheStrategy.js#L1151-L1309)。只有 [PackContainer.version](file:///e:/newGsb/questions/GSB-013/Tony/lib/cache/PackFileCacheStrategy.js#L37-L86)、buildSnapshot、resolveBuildDependenciesSnapshot 都有效时，pack metadata 和 items 才可恢复。
+- `_addModule()` 通过 [Compilation/modules cache](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compilation.js#L1419-L1455) 恢复模块对象；恢复出的模块仍要经过 [needBuild](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L1540-L1592)。snapshot 有效的模块触发 `stillValidModule`，不跑 loader/parser；snapshot 失效的模块才 rebuild。
+- 若 `shared`、`lazy` 和未变入口的 snapshot 有效，模块构建阶段被跳过；SplitChunksPlugin 仍会在 seal 中基于恢复后的模块和依赖重新计算 ChunkGraph。
+- codegen/asset cache item 还要再比较 etag：module hash、dependency template hash、render manifest hash 没变才复用 [code generation](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compilation.js#L3622-L3681) 和 [asset Source](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compilation.js#L4945-L5052)。
+- `emitAssets()` 再根据磁盘状态和 `compareBeforeEmit` 决定是否 writeFile。因此“命中缓存”不等于“一定写盘”，也不等于“完全不运行 seal”；它表示可安全复用模块构建、codegen 或 asset 结果。
+- 如果 webpack 配置、loader 文件或其他 buildDependencies 变化，[buildSnapshot 校验失败](file:///e:/newGsb/questions/GSB-013/Tony/lib/cache/PackFileCacheStrategy.js#L1203-L1286)，整个 pack 不恢复，表现为接近冷启动的全量重建。
+
+### 8.6 复盘时的对象所有权速查
+
+- **Compiler 域长期持有**：`Compiler`、`resolverFactory`、`Cache`、watch 状态、输出文件发射缓存。
+- **每次 Compilation 新建**：`NormalModuleFactory`、`ContextModuleFactory`、`Compilation`、`ModuleGraph`、`ChunkGraph`、`CodeGenerationResults`、assets map。
+- **可跨 Compilation/进程恢复**：NormalModule 对象和 buildInfo/snapshot 通过 `Compilation/modules` cache 与 filesystem pack 恢复；是否可用由 snapshot/valueDependencies/`needBuild` hook 决定。
+- **只存在于构建期**：Dependency、AsyncDependenciesBlock、ModuleGraphConnection、ChunkGraph bookkeeping；它们不直接进入浏览器 runtime。
+- **进入 runtime 域**：generator 输出、dependency templates、RuntimeModule 生成的 `__webpack_require__`、`__webpack_require__.e`、jsonp callback、module factories 等字符串。
+- **watch/cache 域负责**：changed/removed 集合、snapshot、CacheFacade identifier/etag、PackFileCacheStrategy 的 version/buildSnapshot/item etag。
+
+
+## 9. 证据索引：真实路径、symbol 与 hook
+
+| 主题 | 文件路径与 symbol/hook | 已证实结论 |
+|---|---|---|
+| public API 到 Compiler | [webpack.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/webpack.js#L121-L193), [WebpackOptionsApply.process](file:///e:/newGsb/questions/GSB-013/Tony/lib/WebpackOptionsApply.js#L78-L793) | 配置校验/规范化、插件应用、内建设施注册、watch/run 分流顺序。 |
+| Compiler 生命周期 | [Compiler.run](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compiler.js#L474-L609), [Compiler.compile](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compiler.js#L1310-L1355) | beforeRun/run/readRecords、compile、make、finishMake、finish/seal/afterCompile、emit/done 的顺序。 |
+| Compilation/ModuleGraph 所有权 | [Compilation constructor](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compilation.js#L993-L1209), [ModuleGraph](file:///e:/newGsb/questions/GSB-013/Tony/lib/ModuleGraph.js#L128-L243) | Compilation 每轮新建；ModuleGraph 保存 parent/resolved module/connections；seal 时 freeze。 |
+| ChunkGraph 创建 | [Compilation.seal](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compilation.js#L3049-L3427), [ChunkGraph constructor](file:///e:/newGsb/questions/GSB-013/Tony/lib/ChunkGraph.js#L245-L260) | ChunkGraph 在 seal 开始创建，记录 chunk/module/runtime/block 关系。 |
+| 模块工厂 | [NormalModuleFactory.create](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModuleFactory.js#L869-L953), [NormalModuleFactory hooks](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModuleFactory.js#L274-L311) | beforeResolve/factorize/resolve/afterResolve/createModule/module 的顺序和 hook 类型。 |
+| request/resource/loader | [NormalModuleFactory.resolve](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModuleFactory.js#L419-L853) | inline loader 前缀、matchResource、scheme、resolver、rules、pre/normal/post loader 合并顺序。 |
+| loader 执行边界 | [NormalModule._doBuild](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L916-L1087), [NormalModule._createLoaderContext](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L594-L844) | loaderContext API、readResource hook、loader-runner 结果如何变成 source/sourceMap/AST 和依赖集合。 |
+| 模块是否重建 | [NormalModule.needBuild](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L1540-L1592), [FileSystemInfo.checkSnapshotValid](file:///e:/newGsb/questions/GSB-013/Tony/lib/FileSystemInfo.js#L2803-L3249) | forceBuild/error/cacheable/valueDependencies/snapshot/needBuild hook 的判定顺序。 |
+| 静态 import | [HarmonyImportDependencyParserPlugin](file:///e:/newGsb/questions/GSB-013/Tony/lib/dependencies/HarmonyImportDependencyParserPlugin.js#L109-L219), [HarmonyImportDependency.Template](file:///e:/newGsb/questions/GSB-013/Tony/lib/dependencies/HarmonyImportDependency.js#L270-L370) | parser 生成 side-effect/specifier dependency，template 生成 harmony import 和 `__webpack_require__`。 |
+| 动态 import / async block | [ImportParserPlugin](file:///e:/newGsb/questions/GSB-013/Tony/lib/dependencies/ImportParserPlugin.js#L47-L335), [AsyncDependenciesBlock](file:///e:/newGsb/questions/GSB-013/Tony/lib/AsyncDependenciesBlock.js#L24-L115), [ImportDependency.Template](file:///e:/newGsb/questions/GSB-013/Tony/lib/dependencies/ImportDependency.js#L107-L137) | 动态 import 创建 async block/dependency，block 映射到 chunk group，template 生成 namespace promise。 |
+| 初始和异步 chunk 图 | [buildChunkGraph](file:///e:/newGsb/questions/GSB-013/Tony/lib/buildChunkGraph.js#L1301-L1357), [visitModules](file:///e:/newGsb/questions/GSB-013/Tony/lib/buildChunkGraph.js#L380-L1208), [connectChunkGroups](file:///e:/newGsb/questions/GSB-013/Tony/lib/buildChunkGraph.js#L1216-L1273) | initial chunks、async groups、available modules、skipped modules、父子 chunk group 连接规则。 |
+| splitChunks | [SplitChunksPlugin.apply](file:///e:/newGsb/questions/GSB-013/Tony/lib/optimize/SplitChunksPlugin.js#L822-L840), [chunk split/connect](file:///e:/newGsb/questions/GSB-013/Tony/lib/optimize/SplitChunksPlugin.js#L1394-L1589), [Chunk.split](file:///e:/newGsb/questions/GSB-013/Tony/lib/Chunk.js#L542-L551) | optimizeChunks advanced 阶段移动模块到新 chunk 并修改 chunk groups。 |
+| codegen/asset cache | [Compilation.codeGeneration](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compilation.js#L3467-L3681), [createChunkAssets](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compilation.js#L4914-L5070) | codegen key/etag 和 render manifest identifier/hash 如何控制复用。 |
+| runtime loading | [RuntimePlugin ensureChunk](file:///e:/newGsb/questions/GSB-013/Tony/lib/RuntimePlugin.js#L371-L383), [EnsureChunkRuntimeModule](file:///e:/newGsb/questions/GSB-013/Tony/lib/runtime/EnsureChunkRuntimeModule.js#L26-L65), [JsonpChunkLoadingRuntimeModule](file:///e:/newGsb/questions/GSB-013/Tony/lib/web/JsonpChunkLoadingRuntimeModule.js#L90-L468) | `__webpack_require__.e`、`__webpack_require__.f`、installedChunks、script 加载和 webpack chunk callback。 |
+| watch invalidation | [NodeWatchFileSystem](file:///e:/newGsb/questions/GSB-013/Tony/lib/node/NodeWatchFileSystem.js#L30-L189), [Watching](file:///e:/newGsb/questions/GSB-013/Tony/lib/Watching.js#L83-L442) | changed/removed 汇总、watcher pause/resume、running 时只标记 invalid、新一轮 `_go()`。 |
+| dependency summary | [Compilation.summarizeDependencies](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compilation.js#L4203-L4219), [NormalModule.addCacheDependencies](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L1621-L1646) | file/context/missing/build dependencies 如何汇总给下一轮 watch 和 cache。 |
+| CacheFacade/etag | [CacheFacade](file:///e:/newGsb/questions/GSB-013/Tony/lib/CacheFacade.js#L98-L300), [getLazyHashedEtag](file:///e:/newGsb/questions/GSB-013/Tony/lib/cache/getLazyHashedEtag.js#L19-L40) | cache name/identifier/etag 组合为底层 Cache key，etag 惰性 hash。 |
+| filesystem pack | [PackFileCacheStrategy._openPack](file:///e:/newGsb/questions/GSB-013/Tony/lib/cache/PackFileCacheStrategy.js#L1151-L1309), [afterAllStored](file:///e:/newGsb/questions/GSB-013/Tony/lib/cache/PackFileCacheStrategy.js#L1353-L1534), [IdleFileCachePlugin](file:///e:/newGsb/questions/GSB-013/Tony/lib/cache/IdleFileCachePlugin.js#L58-L228) | pack 恢复前验证 version/buildSnapshot/resolve snapshot，idle 时解析 build dependencies 并序列化 pack。 |
+| 资源写出 | [Compiler.emitAssets](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compiler.js#L676-L1021), [config defaults compareBeforeEmit](file:///e:/newGsb/questions/GSB-013/Tony/lib/config/defaults.js#L1148-L1148) | 内存 asset 到磁盘、immutable/compareBeforeEmit、assetEmitted/afterEmit 边界。 |
+
+
+## 10. hook 短路、异步边界和多轮编译要点
 
 - `compiler.hooks.shouldEmit`：`SyncBailHook`，返回 `false` 跳过 `emitAssets()`，但不跳过 `done`。
 - `compiler.hooks.entryOption`：`SyncBailHook`，内建 `EntryOptionPlugin` 返回 `true` 后短路。
@@ -955,11 +1076,13 @@ item 读取走 [restore](file:///e:/newGsb/questions/GSB-013/Tony/lib/cache/Pack
 - `Compilation.hooks.afterHash` 位于部分延后 code generation jobs 之前；涉及 full hash runtime module 时要特别注意。
 - watch 模式下 `Watching.invalid` 可以让正在进行的 emit/done 结果不汇报，直接进入下一轮编译。
 
-## 9. 未证实范围
+## 11. 未证实范围
 
 以下内容本轮没有逐行确认，后续接手时不要把本文当作这些细节的最终结论：
 
-- `NormalModule.build()` 内部 loader-runner、parser、generator 协作的每一步状态变化；
+- loader-runner 包内部 pitch 提前返回、跳过后续 loader 的具体实现；当前仓库只通过 webpack 调用点和类型声明确认边界；
+- `JavascriptModulesPlugin.renderMain()`/`renderChunk()` 中 bootstrap、init fragments、startup 拼接的完整生成细节；
 - `JavascriptModulesPlugin.renderMain()`/`renderChunk()` 中 bootstrap、init fragments、startup 拼接的完整细节；
 - `MultiCompiler` 的并行/依赖调度细节；
-- 所有内建 optimization 插件各自如何修改 module/chunk graph；本文只确认了它们在 `WebpackOptionsApply` 中的注册条件和 `Compilation.seal()` 中的 hook 插槽。
+- 除 `SplitChunksPlugin` 外，其他内建 optimization 插件如何逐字段修改 module/chunk graph；
+- 默认 snapshot 选项在具体配置下最终选择 timestamp、hash 还是 tsh 的值；这由 snapshot options 和运行时解析决定，本文只确认 `createSnapshot()` 的 mode 分支。
