@@ -361,7 +361,7 @@ src/lazy.js   export function lazy() { return "LAZY"; }
 
 浏览器执行路径（本场景，web target）：加载 a.js → runtime modules 初始化 `installedChunks`/`__webpack_require__.f.j` → startup 执行 `./a.js` → 静态 `shared` 经 `__webpack_require__` 命中本 bundle 内副本 → 执行到 `import()`：`__webpack_require__.e("lazy-chunk")` → `f.j` 查 `installedChunks`，未装载则建 Promise 并插入 `<script src=__webpack_require__.p + __webpack_require__.u("lazy-chunk")>` → `lazy-chunk.js` 执行 push → `webpackJsonpCallback` 把工厂并入 `__webpack_modules__` 并 resolve → `.then(__webpack_require__.bind(__webpack_require__, "./lazy.js"))` 取到命名空间执行 `m.lazy()`。
 
-### 7.8 本章运行期核对（临时脚本，仓库外临时目录；工具见第 10 节）
+### 7.8 本章运行期核对（临时脚本，仓库外临时目录；工具见第 11 节）
 
 - 默认配置（`splitChunks.chunks: "async"`）：产物 `a.js`、`b.js`、`lazy-chunk.js` 三个文件。a.js 同时含 `shared` 模块工厂、`__webpack_require__.e(/*! import() | lazy-chunk */ "lazy-chunk").then(__webpack_require__.bind(__webpack_require__, /*! ./lazy */ "./lazy.js"))` 调用点、`__webpack_require__.f.j = ` 与 `installedChunks`；b.js 含 `shared` 模块工厂但无任何 chunk 装载运行时；`lazy-chunk.js` 为 `(...webpackChunk...).push([[...], ...])` 包裹格式。→ 证实 7.3/7.4/7.5/7.6 的默认行为。
 - `splitChunks: { chunks: "all", minSize: 0 }`：多出 `shared_js.js`（含 `shared` 工厂、push 格式），a.js/b.js 不再含 `shared` 工厂；b.js 新出现 `installedChunks`（抽包后入口需先确保共享 chunk 装载）。→ 证实 7.6 的条件讨论。
@@ -407,7 +407,7 @@ src/lazy.js   export function lazy() { return "LAZY"; }
 | `IdleFileCachePlugin`（`lib/cache/IdleFileCachePlugin.js`） | `pendingIdleTasks`（待落盘的 store 任务） | `beginIdle` 后按 `idleTimeout`（默认 60000）/`idleTimeoutForInitialStore`（5000）/`idleTimeoutAfterLargeChanges`（1000，`lib/config/defaults.js:461-463`）落盘；`shutdown` 时强制全部落盘并 `strategy.afterAllStored()`（`:105-131`） |
 | `afterAllStored` 的 buildDependencies 快照（`PackFileCacheStrategy.js:1352-1534`） | 每轮 `done` 后新增的 `compilation.buildDependencies`（`AddBuildDependenciesPlugin` 登记 `cache.buildDependencies`，默认含 webpack 自身 lib 目录，`lib/cache/AddBuildDependenciesPlugin.js:24-29`、`lib/config/defaults.js:469-474`） | 落盘前 `resolveBuildDependencies` + 两次 `createSnapshot` 并与旧快照 `mergeSnapshots` |
 
-`FileSystemInfo` 另有 managed/immutable 路径优化（`createSnapshot` 的 `checkManaged`，`lib/FileSystemInfo.js:2265-2306`；默认 `managedPaths` 指向 node_modules，`lib/config/defaults.js:490-545`）：managed 路径下的文件不做逐文件时间戳快照，而是按包级 managed 项记录（字段细节见第 9 章未证实清单第 10 条）——**直接改 node_modules 里的文件默认不会触发重建**，这是"改了却复用旧结果"最常见的解释之一。
+`FileSystemInfo` 另有 managed/immutable 路径优化（`createSnapshot` 的 `checkManaged`，`lib/FileSystemInfo.js:2265-2306`；默认 `managedPaths` 指向 node_modules，`lib/config/defaults.js:490-545`）：managed 路径下的文件不做逐文件时间戳快照，而是按包级 managed 项记录（字段细节见第 10 章未证实清单第 10 条）——**直接改 node_modules 里的文件默认不会触发重建**，这是"改了却复用旧结果"最常见的解释之一。
 
 ### 8.4 判定表：可安全复用 / 必须重建或重新解析 / 只需重新生成或写出
 
@@ -435,7 +435,7 @@ src/lazy.js   export function lazy() { return "LAZY"; }
   3. touch 类操作（只动 mtime）：开发期 `snapshot.module` 只看 timestamp → 该模块会重建，但内容 hash 不变 → 资产零重写（8.6 实测）——"重建模块"不等于"重写产物"，两个边界要分开看；
   4. `snapshot.module/resolve` 误配为 `{hash: true}` 之外的更弱组合、`managedPaths` 配错导致全量 stat、`aggregateTimeout` 过小导致频繁轮次。
 
-### 8.6 本章运行期核对（临时脚本，仓库外临时目录；工具见第 10 节）
+### 8.6 本章运行期核对（临时脚本，仓库外临时目录；工具见第 11 节）
 
 - **开发默认（memory cache）三轮实测**：首轮全量构建（`built = [a.js, shared.js, lazy.js]`）；真改 `shared.js` 内容 → 第二轮 `built = [shared.js]`、重写只有 `a.js`（`lazy-chunk.js` mtime 不变）；仅 `utimes` touch `shared.js`（内容不变）→ 第三轮 `built = [shared.js]`、**零重写**。→ 证实 8.2 三个边界与 8.4 判定表第 1 行、第 3 行（touch 场景）。
 - **启动期伪 invalid 实测**：源文件在 watch 启动前一刻写入时，watchpack 立即报告 change（`invalid` 事件的 changeTime 等于文件 mtime），产生一轮 `built = []`、零重写的完整 compile。→ 证实 8.4"什么都没改"行的成因。
@@ -445,7 +445,83 @@ src/lazy.js   export function lazy() { return "LAZY"; }
 
 ---
 
-## 9. 未证实 / 待核对清单
+## 9. 模块诞生前段：rule、resolve 与 loader 链
+
+本章追"模块真正被构建出来之前"的一段：`NormalModuleFactory` 如何把一条 request 变成 `NormalModule`，以及 `NormalModule` 如何经 loader-runner、parser、generator 产出内容。线上常见问题（loader 顺序、pitch 短路、`cacheable(false)` 导致的每轮重建、loader 登记依赖缺失导致 watch 失效）都落在这一段。执行域归属：全部在构建期 compiler 域的 make 阶段（第 3.3 节）内。
+
+### 9.1 `NormalModuleFactory` 管线总览
+
+- `Compilation._factorizeModule` 调 `factory.create(data, cb)`（`lib/NormalModuleFactory.js:869-953`）：先构造 `resolveData`（含 `contextInfo`、`resolveOptions`、`context`、`request`、`assertions`、`dependencies`、`dependencyType`（`dep.category`，如 `"esm"`）、三个依赖集合、`createData: {}`、`cacheable: true`）。
+- 随后：`hooks.beforeResolve`（`AsyncSeriesBailHook`，返回 `false` 即忽略该依赖，`:896-921`）→ `hooks.factorize`（其内部 stage 100 tap 串 `resolve` → `afterResolve` → `createModule` → `module`，`:340-418`；外部插件可在更早 stage 短路整个 factorize）。
+- `createModule` 无结果时按 `createModuleClass.for(type)`（HookMap）造模块，默认 `new NormalModule(createData)`（`:389-403`）；`resolveData.request` 为空报 "Empty dependency"。
+
+### 9.2 `resolve` tap：request 与 resource 如何确定（`lib/NormalModuleFactory.js:419-853`）
+
+1. **matchResource 前缀**：`./fake.css!=!./real.css` 形式拆出 `matchResourceData`（`:449-479`）；后续 rule 匹配与 `userRequest` 用 matchResource，真实读取仍用 `resourceData`；`matchResource` 的 `.webpack[type]` 后缀可直接指定模块类型（`:577-589`）。
+2. **scheme 分流**：request 自带 scheme（`data:`/`file:`/`https:`…）→ `hooks.resolveForScheme.for(scheme)`（`AsyncSeriesBailHook`，由 `DataUriPlugin`/`FileUriPlugin`/`HttpUriPlugin` 挂，`:813-829`）；context 带 scheme → `hooks.resolveInScheme`（`:831-848`）；否则走 `defaultResolve`（`:765-811`，`getResolver("normal", ...)` + enhanced-resolve）。
+3. **内联 loader 语法**：无 scheme 时识别前缀——`-!`（noPreAutoLoaders）、`!`（noAutoLoaders）、`!!`（noPrePostAutoLoaders）（`:483-488`）；按 `!` 拆 `elements`，**最后一个元素是 resource，其余是内联 loader**（`:489-505`）。
+4. **并行解析（`needCalls(2)`）**：内联 loader 经 `resolveRequestArray` 用 **loaderResolver**（`resolveLoader` 配置）逐个解析（`:1161-1238`；裸名缺 `-loader` 后缀时给出 BREAKING CHANGE 提示，`:1180-1201`；产出 `LoaderItem{loader, type(.mjs/.cjs/package.json type), options, ident}`）；resource 经 normal resolver 解析（`resolveContext` 把解析过程触碰的 file/context/missing 收集进 compilation 依赖集——这是 resolve 层登记 watch/snapshot 事实的通道）。
+5. **rule 匹配**：`this.ruleSet.exec({resource, realResource, resourceQuery, resourceFragment, scheme, assertions, mimetype, dependency, descriptionData, issuer, compiler, issuerLayer})`（`:593-610`）。返回的效果分为：`use`/`use-post`/`use-pre`（`UseEffectRulePlugin` 把 `rule.enforce` 映射成这三类，`lib/rules/UseEffectRulePlugin.js:51-53`）与 `type`/`sideEffects`/`parser`/`generator`/`resolve`/`layer`（对象型 `cleverMerge` 合并进 `settings`，`:611-645`）。禁用规则：`!!` 禁用全部 rule loader 且不改 `type`；`!` 禁 `use`；`-!` 禁 `use-pre`（`:613-628`）。
+6. **loader 数组顺序**（`:659-672`）：`allLoaders = postLoaders + (inline + normalLoaders) + preLoaders`（有 matchResource 时 inline 与 normalLoaders 位置互换）。**这个顺序就是 loader-runner 的下标顺序，直接决定 pitch/normal 执行序**（9.4）。
+7. **createData**（`:683-708`）：`request`（完整 loader 链 + resource 的字符串，是模块 `identifier()` 的基础，因此也决定 `_modulesCache` 的 key 与去重）、`userRequest`、`rawRequest`、`loaders`、`resource`、`context`、`matchResource`、`resourceResolveData`、`settings`、`type`、`parser`/`generator`（`getParser(type, settings.parser)`/`getGenerator`：按 type+options 以 WeakMap 缓存；`hooks.createParser.for(type).call(parserOptions)` 造实例，`hooks.parser.for(type).call(parser, parserOptions)` 让依赖插件挂 parser 插件——第 7.1 节的挂点，`:1245-1324`）、`resolveOptions`。
+8. resource 解析为 `false` → `dependencies[0].createIgnoredModule(context)`（`:557-560`，如 `IgnorePlugin` 的效果）。
+
+### 9.3 `NormalModule.build` → loader-runner → parser（`lib/NormalModule.js`）
+
+- `build()`（`:1175-1202`）重置模块状态后 `_doBuild`；`startTime = compilation.compiler.fsStartTime || Date.now()`（`:1198`）——这是 snapshot 的时间基准（第 8 章"构建开始后又被改"判定的参照）。
+- `_doBuild`（`:916-1086`）：`_createLoaderContext`（9.6）→ `hooks.beforeLoaders.call(this.loaders, this, loaderContext)`（SyncHook，插件可在此改 loader 列表，`:996-1006`）→ `runLoaders({resource, loaders, context: loaderContext, processResource})`（`:1013`）。
+- **资源读取点**：loader-runner 全部 pitch 通过后才回调 `processResource` → `hooks.readResource.for(scheme).callAsync(loaderContext)`（`:1023-1041`）；默认（无 scheme 的文件）由 `FileUriPlugin` 提供的 tap 完成 `loaderContext.addDependency(resourcePath)` + `fs.readFile`（`lib/schemes/FileUriPlugin.js:39-45`）——**资源文件因此自动进入 fileDependencies**；`data:`/http(s) 由对应 scheme 插件读取。
+- **结果处理**：`processResult`（`:930-986`）：loader err → 包装 `ModuleBuildError`（`from` 取当前 loader，`:931-943`）；否则经 `hooks.processResult`（SyncWaterfallHook，可改写结果）取出 `[content, sourceMap, extraInfo]`；content 非 Buffer/String → `ModuleBuildError("Final loader ... didn't return a Buffer or String")`（`:953-966`）；`createSource` 按 sourceMap 配置生成 `Source`；`extraInfo.webpackAST` → `this._ast`（loader 可直接交 AST）。
+- **parse**：`noParse` 命中则跳过（`shouldPreventParsing`，`:1123-1146`）；否则 `this.parser.parse(this._ast || source, {source, current, module, compilation, options})`（`:1353-1367`）——产出第 7 章的 `Dependency`/`AsyncDependenciesBlock`。parse 抛错 → `ModuleParseError`（带 loaders 与 type，`:1214-1227`）。
+- **收尾**：`handleParseResult` 排序 dependencies、`_initBuildHash`（source + buildMeta → `buildInfo.hash`，`:1152-1165`）→ `handleBuildDone` → `hooks.beforeSnapshot` → `createSnapshot`（**仅当 `cacheable` 且 `snapshot.module` 配置存在**，`:1251-1255`；非绝对路径依赖会被警告并尝试绝对化，`:1256-1293`）——即第 8.2 节快照的诞生点。
+
+### 9.4 loader-runner 执行模型（`node_modules/loader-runner/lib/LoaderRunner.js`，随依赖锁定版本）
+
+- **pitch 从左到右**：`iteratePitchingLoaders`（`:168-212`）从 `loaderIndex = 0` 起沿 9.2 的数组顺序（post → inline → normal → pre）逐个调 `pitch(remainingRequest, previousRequest, data)`。语义：越靠左的 loader 越早拿到"要不要短路"的决定权，`remainingRequest` 告诉它右侧还剩什么。
+- **pitch 提前返回的跳过语义**（`:196-208`）：pitch 回调出现**任一非 `undefined` 返回值**即短路——`loaderIndex--` 转入 normal 阶段。被跳过的有：**其右所有 loader 的 pitch、资源读取（`processResource` 不执行）、以及包括自己在内其右所有 loader 的 normal**（右侧 loader 的 `pitchExecuted` 已置位，但 normal 从短路者左边开始）。返回值直接作为 content 交给左侧 normal 链。`data` 对象在同一 loader 的 pitch 与 normal 间共享（`:193`、`:382-387`）。
+- **资源读取**：`processResource`（`:214-229`）把 `loaderIndex` 拨到最右，读出的 `resourceBuffer` 作为初始 content。
+- **normal 从右到左**：`iterateNormalLoaders`（`:231-257`）`loaderIndex` 递减执行 normal，每级把上一级的 `[content, sourceMap?, meta?]` 传给下一级；`convertArgs` 按 loader 的 `raw` 标记做 Buffer/string 转换（`:161-166`）。反向的原因：最靠近资源的 loader 先看到原始内容，输出逐级向左变换（函数复合）。
+- **context 注入**（`:298-326`）：`cacheable(flag)`（只有 `false` 有效）、`addDependency`/`dependency`、`addContextDependency`、`addMissingDependency`（收集进 result 返回给 webpack）、`clearDependencies`（清空三类依赖并重置 cacheable）、`async()`/`callback()`（`runSyncOrAsync`，`:103-159`，重复调用报错）。
+- **错误**：loader 模块加载失败 → `cacheable(false)` + 中断（`:182-186`）；pitch/normal 抛错或 `callback(err)` → `runLoaders` 以 err 结束（deps 与 cacheable 仍随 result 返回）。
+
+**运行期实测**（临时 loader，9.7）：无 pitch 返回时调用序为 `A.pitch → B.pitch → C.pitch → C.normal → B.normal → A.normal`，且无效资源被读取并触发 `ModuleParseError`；中间 loader pitch 返回合法 JS 时调用序为 `A.pitch → B.pitch → A.normal`，`C.pitch`、资源读取、B/C 的 normal 全部跳过，构建零错误。
+
+### 9.5 loader 行为 → 快照失效 / 模块构建 / 错误传播的映射
+
+| loader 行为 | 直接效果（调用点） | 对 watch/cache（第 8 章） | 错误传播 |
+| --- | --- | --- | --- |
+| `this.addDependency`/`addContextDependency`/`addMissingDependency` | 进 loader-runner 的数组 → `buildInfo.fileDependencies` 等（`lib/NormalModule.js:1073-1075`）→ `createSnapshot` → compilation 三类依赖集 | 成为 watch 监听集与 snapshot 校验项；变化仅使本模块失效重建（8.4 表） | 非绝对路径被警告并尝试绝对化（`:1256-1293`） |
+| `this.cacheable(false)` | `requestCacheable=false` → `buildInfo.cacheable=false`（`:1083`） | **不建 snapshot**（`:1252-1255`）；模块仍被 `_modulesCache` 存取（`lib/Compilation.js:1536` 无条件 store），但 `needBuild` 对 `!cacheable` 恒 true（`lib/NormalModule.js:1552`）→ **每轮必重建**——"什么都没改却整轮重做"的典型 loader 侧成因 | — |
+| 返回 `[content, sourceMap]` | `createSource`（`:973-978`）→ `buildInfo.hash`（`:1152-1165`） | 内容 hash 决定模块 hash → chunk hash → 资产是否重写（8.2 边界 2/3） | — |
+| 返回 `[content, map, { webpackAST }]` | `this._ast`（`:980-985`）→ `parser.parse(this._ast \|\| source)`（`:1356`），跳过 acorn 重解析 | AST 不进 snapshot（以 source 为准） | AST 与 source 不符 → parse 错 → `ModuleParseError` |
+| 抛错 / `callback(err)` | `ModuleBuildError`（`from` 当前 loader，`:931-943`）→ `markModuleAsErrored`（恢复 `_lastSuccessfulBuildMeta`，`:1093-1098`） | 带 error 的模块 `needBuild` 恒 true（`:1546`）→ 每轮重试 | 经 `module.getErrors()` 进 `compilation.errors`（finish）；codeGeneration 时 `generator.generateError` 或兜底 `throw new Error(...)`（`:1477-1493`）→ 运行时抛错模块 |
+| `this.emitWarning`/`emitError` | `ModuleWarning`/`ModuleError`（`from` loader 名）挂模块（`:725-744`） | — | finish 汇总进 stats |
+| 末级未返回 Buffer/String | `ModuleBuildError`（`:953-966`） | 同上 | 同上 |
+| `this.addBuildDependency` | `buildInfo.buildDependencies` → `compilation.buildDependencies`（`:811-818`；所有 loader 路径也会被自动加入，`:1076-1082`） | filesystem cache 信任链（8.3） | — |
+| `this.emitFile` | `buildInfo.assets` → `createModuleAssets`（`lib/Compilation.js:4877`） | 模块级资产，随 emit 域写出 | — |
+| `this.loadModule`/`importModule` | 触发子模块构建（`LoaderPlugin` 注入，`lib/dependencies/LoaderPlugin.js:62/268`） | 子模块有自己的依赖链与 snapshot | 构建错误经回调传给 loader |
+
+### 9.6 loader 与 compiler plugin 的可观察/可改变边界
+
+- **loader 能看到的**：单个模块的 content、`resourcePath/Query/Fragment`、loader 链位置、options、`fs`、`resolve`/`getResolve`；能改变的：内容与 map/AST、依赖登记、cacheable、warnings/errors、`emitFile`、子模块构建。loader 拿不到 `ChunkGraph`/全局图（`_compilation` 是内部引用，非公开 API 面）。
+- **compiler plugin 能挂的点**（按本管线顺序）：
+  1. `compiler.hooks.normalModuleFactory`/`contextModuleFactory`（每次 compile 创建 factory 后）→ 挂 factory hooks；
+  2. `NormalModuleFactory.hooks`：`beforeResolve`（bail `false` 忽略依赖）/`resolve`/`factorize`/`createModule`（可换模块实例）/`afterResolve`；`createParser`/`createGenerator`（HookMap，可换解析器/生成器类）；`parser`/`generator`（HookMap，挂 parser 插件——第 7 章的 Dependency 注册面）；
+  3. `compiler.resolverFactory.hooks.resolveOptions`（`WebpackOptionsApply` 也在此合并 `resolve`/`resolveLoader`，`lib/WebpackOptionsApply.js:764-791`）→ 改变 resolve 行为；
+  4. `NormalModule.getCompilationHooks(compilation)`（`lib/NormalModule.js:275-332`）：`loader`（改 loaderContext——`LoaderPlugin` 在此注入 `loadModule`/`importModule`）、`beforeLoaders`（改 loader 列表）、`readResource.for(scheme)`（接管资源读取——`FileUriPlugin` 的默认读法也在此）、`processResult`（改写 `[content, map, extraInfo]`）、`beforeParse`、`beforeSnapshot`、`needBuild`（额外否决模块复用，`:1579-1590`）；
+  5. `compilation.hooks.buildModule`/`succeedModule`/`failedModule`/`stillValidModule`（观察构建结果）及第 3、7 章的全部 seal 期 hooks。
+- 一句话：**rule（resolve 层）决定"用哪些 loader、哪种 parser/generator"；loader 决定"内容"；parser 决定"依赖"；generator 决定"产物形态"**。loader 只能影响"单个模块的内容与依赖事实"，plugin 才能改变"模块如何被解析、创建、缓存与链接"。
+
+### 9.7 本章运行期核对（临时脚本，仓库外临时目录；工具见第 11 节）
+
+- 自建 3 个带日志的 loader 施加于同一 rule：
+  - 无 pitch 返回：调用序实测为 `A.pitch → B.pitch → C.pitch → C.normal → B.normal → A.normal`；资源文件（故意写成无效 JS）被读取并触发 `ModuleParseError`（模块带 `[1 error]` 但构建完成）——证实 9.4 的两个方向与"pitch 全通过才读资源"。
+  - 中间 loader 的 pitch 返回合法 JS：调用序实测为 `A.pitch → B.pitch → A.normal`，`C.pitch`、资源读取、B/C 的 normal 均未发生，`stats.hasErrors() === false`，产物含 pitch 返回的内容——证实 9.4 的短路跳过清单。
+- 未做：`webpackAST` 快路径、`loadModule`/`importModule` 子构建、`data:` 等 scheme 的运行期核对（结论仍属静态阅读）。
+
+---
+
+## 10. 未证实 / 待核对清单
 
 以下内容本轮**未逐行核对或无法从当前版本确认**，后续按需要补读：
 
@@ -457,12 +533,12 @@ src/lazy.js   export function lazy() { return "LAZY"; }
 6. `lib/config/target.js` 的 browserslist 解析细节（只确认函数名与调用点）。
 7. `processRuntimeRequirements` 中 module 级收集段（`:3708-3800` 前段）的逐行逻辑。
 8. `lib/index.js` 的全部 lazy 导出清单（只读头部 120 行）。
-9. 除第 10 节已核对的运行期行为外，其余调用顺序结论来自静态阅读。
+9. 除第 11 节已核对的运行期行为外，其余调用顺序结论来自静态阅读。
 10. `FileSystemInfo` managed 项记录的具体字段（`getManagedItem`/`managedItemInfo`，判定为包级管理信息，未逐行确认字段构成）；`checkResolveResultsValid` 的判定细节；watchpack 自身的 startTime 过滤语义（按事件表现推断）。
 
 ---
 
-## 10. 核对记录
+## 11. 核对记录
 
 - [x] 源码逐行阅读：`lib/webpack.js`、`lib/Compiler.js`、`lib/Compilation.js`（主链路）、`lib/config/{normalization,defaults}.js`、`lib/WebpackOptionsApply.js`、`lib/EntryOptionPlugin.js`、`lib/EntryPlugin.js`、`lib/DynamicEntryPlugin.js`、`lib/node/NodeEnvironmentPlugin.js`、`lib/Watching.js`、`lib/Cache.js`、`lib/NormalModuleFactory.js`（主链路段）、`lib/buildChunkGraph.js`（结构）、`lib/ModuleGraph.js`/`lib/ChunkGraph.js`（结构与静态反查）、`lib/validateSchema.js`、`lib/MultiCompiler.js`（部分）、`lib/javascript/JavascriptModulesPlugin.js`（hook 挂点）。
 - [x] `yarn install --frozen-lockfile`（Yarn 1.22.22，lockfile 未变；安装后 `git status` 仍只有本文件一个改动）。
@@ -476,4 +552,6 @@ src/lazy.js   export function lazy() { return "LAZY"; }
 - [x] 第 7 章场景运行期冒烟：两入口 + 共享模块 + 带 `webpackChunkName` 的动态 `import()`，development 默认配置与 `splitChunks: { chunks: "all", minSize: 0 }` 各构建一次，结果见 7.8（全部通过，临时脚本已删除）。
 - [x] 第 8 章（watch/cache）源码阅读：`lib/Watching.js`、`lib/node/NodeWatchFileSystem.js`、`lib/FileSystemInfo.js`（`createSnapshot`/`checkSnapshotValid`/managed 段）、`lib/NormalModule.js`（`needBuild`/snapshot 创建段）、`lib/CacheFacade.js`、`lib/cache/{MemoryCachePlugin,IdleFileCachePlugin,PackFileCacheStrategy,AddBuildDependenciesPlugin,getLazyHashedEtag}.js`、`lib/config/defaults.js`（snapshot/cache 默认段）。
 - [x] 第 8 章 watch 运行期冒烟（临时脚本已删）：开发默认 memory cache 下"真改内容 / 仅 touch"两轮（`built=[shared.js]`，重写分别为 `[a.js]` 与 `[]`）；启动期伪 invalid 产生零重建轮次；`cache: false` 对照为每轮全量重建。结果见 8.6。
+- [x] 第 9 章（rule/resolve/loader 链）源码阅读：`lib/NormalModuleFactory.js`（`create`/`resolve` tap 全文/`resolveRequestArray`/`getParser`/`getGenerator`）、`lib/NormalModule.js`（`_createLoaderContext`/`_doBuild`/`processResult`/`build`/`markModuleAsErrored`/`codeGeneration`/`needBuild`）、`node_modules/loader-runner/lib/LoaderRunner.js`（全量）、`lib/rules/UseEffectRulePlugin.js`（enforce 映射）、`lib/schemes/FileUriPlugin.js`、`lib/dependencies/LoaderPlugin.js`（注入点）。
+- [x] 第 9 章 loader 运行期冒烟（临时脚本已删）：pitch 左→右、normal 右→左的调用序实测；pitch 提前返回跳过右侧 pitch、资源读取与右侧 normal 的实测；无效资源触发 `ModuleParseError` 但构建完成。结果见 9.7。
 - 未做：filesystem cache 跨进程恢复/失效的运行期核对（8.3/8.4 相关结论中 Pack 策略部分仍属静态阅读）。
