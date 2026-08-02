@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig",
+  "compilerOptions": {
+    "types": ["node", "jest"]
+  },
+  "include": [
+    "declarations.d.ts",
+    "declarations/*.d.ts",
+    "test/**/webpack.config.js",
+    "test/cases/**/*loader*.js",
+    "test/watchCases/**/*loader*.js",
+    "test/configCases/**/*loader*.js",
+    "test/hotCases/**/*loader*.js",
+    "declarations.test.d.ts"
+  ]
+}

@@ -1,0 +1,26 @@
+codecov:
+  branch: main
+coverage:
+  precision: 2
+  round: down
+  range: "70...100"
+  status:
+    project:
+      default:
+        flags:
+          - unit
+          - integration
+        target: auto
+    patch:
+      default:
+        flags:
+          - unit
+          - integration
+        target: 90%
+        base: pr
+    changes:
+      default:
+        flags:
+          - unit
+          - integration
+comment: off
