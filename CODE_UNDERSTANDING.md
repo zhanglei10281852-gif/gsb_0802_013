@@ -264,7 +264,113 @@ profile 汇总 → `_computeAffectedModules` → `hooks.finishModules.callAsync(
 
 ---
 
-## 7. 未证实 / 待核对清单
+## 7. 场景追踪：一条 `import` 如何变成图与浏览器装载逻辑
+
+本章用一个具体场景把 parser → Dependency → `AsyncDependenciesBlock` → `ModuleGraph` → `buildChunkGraph` → `ChunkGraph` → code generation → runtime requirements → `RuntimeModule` 串成一条链。场景（目标 web、默认配置）：
+
+```text
+src/a.js      import { shared } from "./shared"; console.log("a", shared);
+              import(/* webpackChunkName: "lazy-chunk" */ "./lazy").then(m => m.lazy());
+src/b.js      import { shared } from "./shared"; console.log("b", shared);
+src/shared.js export const shared = "SHARED";
+src/lazy.js   export function lazy() { return "LAZY"; }
+配置: entry: { a: "./a.js", b: "./b.js" }, mode: "development"
+```
+
+对象所有权沿用 3.6 节；三个执行域沿用第 1 节。本章末尾（7.7）汇总"哪些结构只在构建期、哪些信息被翻译进 emitted runtime"。
+
+### 7.1 parser 阶段（make 内 `module.build` 时）：源码 → `Dependency` / `AsyncDependenciesBlock`
+
+- **静态 `import { shared } from "./shared"`**：`HarmonyModulesPlugin` 在 `compiler.hooks.compilation` 上注册工厂/模板并挂 parser 插件（`lib/dependencies/HarmonyModulesPlugin.js:53-142`）。`HarmonyImportDependencyParserPlugin` 工作：
+  - `parser.hooks.import` tap → 每条 import 语句创建一个 `HarmonyImportSideEffectDependency`（`lib/dependencies/HarmonyImportDependencyParserPlugin.js:109-130`）；
+  - `parser.hooks.importSpecifier` tap → 每个被使用的说明符（如 `shared`）创建一个 `HarmonyImportSpecifierDependency`（`:134-216`）；
+  - 均通过 `parser.state.module.addDependency(...)` 挂到**当前模块的 `module.dependencies`**。
+- **动态 `import("./lazy")`**：`ImportPlugin` 把 `ImportDependency → normalModuleFactory` 与 `ImportDependency.Template` 注册进 `compilation.dependencyFactories/dependencyTemplates`（`lib/dependencies/ImportPlugin.js:35-42`），并给三类 js 模块挂 `ImportParserPlugin`。后者 tap `parser.hooks.importCall`（`lib/dependencies/ImportParserPlugin.js:47`）：参数是字符串字面量且 `webpackMode` 为默认 `"lazy"` 时——
+  - 创建 `new AsyncDependenciesBlock({ ...groupOptions, name: chunkName }, loc, request)`（`:282-289`；`webpackChunkName` 注释写入 `groupOptions.name`，`:108-118`）；
+  - 块内创建唯一的 `new ImportDependency(request, range, exports, attributes)`（`:290-295`），`dep.optional = Boolean(parser.scope.inTry)`（`:297`，try/catch 内的 import 出错只警告）；
+  - `depBlock.addDependency(dep)` + `parser.state.current.addBlock(depBlock)`（`:298-299`）→ block 进入 **`module.blocks`**（`DependenciesBlock` 结构，`lib/DependenciesBlock.js`；`AsyncDependenciesBlock` 定义 `lib/AsyncDependenciesBlock.js:24`，持有 `groupOptions`）。
+  - 变体：`webpackMode: "eager"` → 直接 `ImportEagerDependency`、**不产生 block、不产生异步 chunk**（`:266-272`）；`"weak"` → `ImportWeakDependency`；非字面量参数 → `ContextDependencyHelpers.create(ImportContextDependency, ...)`（`:306-333`，走 contextModuleFactory）。
+- 归属：`Dependency`/`AsyncDependenciesBlock` 归模块所有，随模块在 make 阶段产生；**纯构建期结构**，不会原样出现在产物里。
+
+### 7.2 make 阶段：`Dependency` → `ModuleGraph`
+
+- `Compilation._processModuleDependencies`（`lib/Compilation.js:1593`）用队列遍历模块及其嵌套 blocks（`:1854-1867`）：对 block 里每个 dep 先 `moduleGraph.setParents(dep, currentBlock, module, index)`（`:1672`）——这一步记录 dep 的父 block 与父模块，正是后面 code generation 里 `moduleGraph.getParentBlock(dep)`（`ImportDependency.Template`，7.4）与 `getParentModule` 的数据来源；然后按 factory 分组，逐组递归 `handleModuleCreation`（3.3 节）。
+- 每组依赖经 `NormalModuleFactory` 解析、构建后，`moduleGraph.setResolvedModule(originModule, dep, module)` 建立 **`ModuleGraphConnection`**（`lib/ModuleGraphConnection.js`）。
+- 本场景结果：`shared.js` 只存在**一个模块实例**（`_addModule` 按 `module.identifier()` 去重，`lib/Compilation.js:1420-1424`），图中有 a→shared、b→shared 两条 connection；a 的 `module.blocks[0]`（AsyncDependenciesBlock）内有 a→lazy 的 connection，且该 dep 的 parent block 指向这个 block。
+- 至此一切都还在 `ModuleGraph`（构建期，`Compilation` 构造时创建）里，**`ChunkGraph` 尚不存在**（seal 开头才创建，3.5 节）。
+
+### 7.3 seal 阶段：`buildChunkGraph` → `ChunkGraph`、chunk 的形成与复用条件
+
+- seal 为 a、b 各建 Chunk + `Entrypoint`；无 `dependOn`/`runtime` 时 `entrypoint.setRuntimeChunk(chunk)`（`lib/Compilation.js:3096-3098`），即**入口 chunk 自己就是 runtime chunk**（`Chunk.hasRuntime()` 判定见 `lib/Chunk.js:445-455`）。
+- `buildChunkGraph(this, chunkGraphInit)`（`lib/buildChunkGraph.js:1301`）从入口 BFS：
+  - 到达模块时 `chunkGraph.connectChunkAndModule(chunk, module)`（`:829`）。`shared` 从 a、b 两个入口分别可达 → **同时被 connect 到 a 的 chunk 和 b 的 chunk**（默认配置下两入口各持一份，见 7.6 的条件讨论）。
+  - 到达 `AsyncDependenciesBlock` 时 `iteratorBlock(b)`（`:488`）：
+    - 若父 chunk group 的 `chunkLoading`/`asyncChunks` 为 false → **不建异步 chunk**，block 并入当前 chunk group 继续遍历（`:569-578`）；
+    - 否则按名字复用或新建：`namedChunkGroups.get(chunkName)` 命中即复用已有 ChunkGroup（`:580`；这就是"多个 `import()` 用同一 `webpackChunkName` 会合并"的依据），未命中则 `compilation.addChunkInGroup(b.groupOptions || b.chunkName, module, b.loc, b.request)`（`:582`，实现 `lib/Compilation.js:3897`）新建 ChunkGroup + Chunk；具名块指向已存在的 **initial** chunk 会报 `AsyncDependencyToInitialChunkError`（`:613-620`）；
+    - 父子关系暂存 `blockConnections`，最后 `connectChunkGroupParentAndChild`（`:1267`）并 `chunkGraph.connectBlockAndChunkGroup(block, chunkGroup)`（`:1264`；存储于 `ChunkGraph._blockChunkGroups`，`lib/ChunkGraph.js:1328-1331`）——`getBlockChunkGroup(block)` 是 7.4 生成 `__webpack_require__.e` 的查询入口；
+    - 异步块内模块若已在父链可用，经 `minAvailableModules` 位掩码机制跳过（`skippedItems`，`:894-910` 一带），不重复进异步 chunk。
+- 本场景产物：`ChunkGraph` 上共有 3 个 chunk——`a`（runtime chunk）、`b`（runtime chunk）、`lazy-chunk`（普通异步 chunk，名字来自 magic comment）；`ChunkGraph`/`Chunk`/`ChunkGroup` 同样是**纯构建期结构**。
+
+### 7.4 code generation：`Dependency` → 运行时代码片段与 runtime requirements
+
+`Compilation.codeGeneration` 对每个模块调 `module.codeGeneration()`，模块再用 `dependencyTemplates` 对每个 Dependency 调 `Template.apply(dep, source, context)`；`context.runtimeRequirements` 是**要被填充的需求集合**（3.5 节第 8 步）。
+
+- **静态 import**：`HarmonyImportDependency.Template.apply`（`lib/dependencies/HarmonyImportDependency.js:279`）→ `getImportStatement` → `runtimeTemplate.importStatement(...)`（`lib/RuntimeTemplate.js:790`）：生成 `var shared__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/* moduleId */)` 之类的声明 + 兼容调用，以 `InitFragment`（`STAGE_HARMONY_IMPORTS`）形式注入模块头部；`HarmonyImportSpecifierDependency.Template.apply`（`lib/dependencies/HarmonyImportSpecifierDependency.js:325-348`）把源码中对 `shared` 的引用范围替换为 importVar 上的属性访问（`propertyAccess(ids)`）。模块 id 由 seal 的 `moduleIds` hook 分配（默认 development `"named"`、production `"deterministic"`，`lib/config/defaults.js:1523-1531`）。
+- **动态 import**：`ImportDependency.Template.apply`（`lib/dependencies/ImportDependency.js:116-136`）把 `import(...)` 表达式整体替换为 `runtimeTemplate.moduleNamespacePromise({...})` 的输出：
+  - `blockPromise`（`lib/RuntimeTemplate.js:986`）：`chunkGraph.getBlockChunkGroup(block)` 取不到 chunk 或 chunks 为空 → 退化为 `Promise.resolve()`；恰一个可加载 chunk → 生成 `__webpack_require__.e(chunkId)` 并 **`runtimeRequirements.add(RuntimeGlobals.ensureChunk)`**（`:1009`）；多个 chunk → `Promise.all([...__webpack_require__.e(...)])`；
+  - 命名空间语义：`.then(__webpack_require__.bind(__webpack_require__, moduleId))` 并 `runtimeRequirements.add(RuntimeGlobals.require)`（`:690-691`）；被引模块是 CJS 互操作时用 `RuntimeGlobals.createFakeNamespaceObject`（`:701`）。
+- **本场景实测**（development）：a.js 中该表达式生成——
+  `__webpack_require__.e(/*! import() | lazy-chunk */ "lazy-chunk").then(__webpack_require__.bind(__webpack_require__, /*! ./lazy */ "./lazy.js"))`
+- 关键转折：**chunk 边界（block）在这一步被翻译成"chunkId 字符串 + RuntimeGlobals 函数调用"，同时把"需要哪些 runtime 函数"声明进 runtimeRequirements**。生成结果存 `CodeGenerationResults`（构建期），文本本身将进入 emitted runtime。
+
+### 7.5 runtime requirements → `RuntimeModule`：需求级联
+
+`Compilation.processRuntimeRequirements`（`lib/Compilation.js:3708`）按 module → chunk → tree 三级收集需求；tree 级对每个 `chunkGraphEntries`（entrypoint 的 runtime chunk，`:3685-3697`）的需求集合逐项调 `hooks.runtimeRequirementInTree.for(r).call(chunk, set, context)`。JS `Set` 迭代允许边迭代边新增，因此需求会**级联触发**。本场景在 a 的 runtime chunk 上：
+
+1. codegen 声明的 `RuntimeGlobals.ensureChunk` 命中 `RuntimePlugin` 的 tap（`lib/RuntimePlugin.js:371-383`）：`chunk.hasAsyncChunks()` 为真 → 向集合追加 `RuntimeGlobals.ensureChunkHandlers`，并 `compilation.addRuntimeModule(chunk, new EnsureChunkRuntimeModule(set))`。该模块生成 `__webpack_require__.e = chunkId => Promise.all(Object.keys(__webpack_require__.f).reduce(...))`（`lib/runtime/EnsureChunkRuntimeModule.js:35-53`）。
+2. 新加入的 `ensureChunkHandlers` 命中 `JsonpChunkLoadingPlugin` 的 handler（`lib/web/JsonpChunkLoadingPlugin.js:42-55`，每 chunk 只挂一次）：`addRuntimeModule(chunk, new JsonpChunkLoadingRuntimeModule(set))`，并追加 `publicPath`/`loadScript`/`getChunkScriptFilename` 三个需求（`:69-76`）。
+3. 这三个需求再命中 `RuntimePlugin` 对应 taps → `PublicPathRuntimeModule`、`LoadScriptRuntimeModule`（`__webpack_require__.l`，`lib/RuntimePlugin.js:395-410`）、`GetChunkFilenameRuntimeModule`（生成 `__webpack_require__.u = chunkId => ...` 的 chunkId→URL 映射，`lib/runtime/GetChunkFilenameRuntimeModule.js:19`）。
+4. `RuntimeGlobals.require` 等经 `GLOBALS_ON_REQUIRE` 补 `requireScope`（`lib/RuntimePlugin.js:130-141`）。
+
+`addRuntimeModule`（`lib/Compilation.js:3843`）把 runtime module 接到 runtime chunk（`connectChunkAndRuntimeModule`）并触发 `hooks.runtimeModule.call(module, chunk)`（`:3886`）。**b 的 runtime chunk 没有任何人声明 `ensureChunk`，所以 b.js 不含 chunk 装载运行时**（实测确认，见 7.8）。
+
+`JsonpChunkLoadingRuntimeModule.generate`（`lib/web/JsonpChunkLoadingRuntimeModule.js:75`）生成 JSONP 装载逻辑：`installedChunks` 注册表（以 `getInitialChunkIds` 播种初始 chunk，`:123/135-143`）、`__webpack_require__.f.j`（Promise + `url = __webpack_require__.p + __webpack_require__.u(chunkId)` + 插入 `<script>`，`:147-180`）、`webpackJsonpCallback` 并劫持全局 `chunkLoadingGlobal` 数组的 `push`（`:463-465`）。挂接来源：`output.chunkLoading` 默认 web→`"jsonp"`，`WebpackOptionsApply` 应用 `EnableChunkLoadingPlugin`（`lib/WebpackOptionsApply.js:221-222`）→ `JsonpChunkLoadingPlugin`（`lib/javascript/EnableChunkLoadingPlugin.js:78-81`）。
+
+### 7.6 chunk → 文件（写入产物的 runtime 域）与共享/复用条件
+
+- `createChunkAssets` 对每个 chunk 走 `hooks.renderManifest` → `JavascriptModulesPlugin` 的 tap（`lib/javascript/JavascriptModulesPlugin.js:307`）：runtime chunk → `renderMain`（`:771`），非 runtime chunk → `renderChunk`（`:700`）。
+  - `renderMain`：`var __webpack_modules__ = ({...模块工厂...})`（`:848`）→ bootstrap 头（`__webpack_require__` 函数本体由 `renderRequire`（`:1407-1491`）在需要时生成，含 module cache）→ **runtime modules 渲染**（`chunkGraph.getChunkRuntimeModulesInOrder(chunk)` → `Template.renderRuntimeModules`，`:871-880`，此调用触发 runtime module 的 codeGeneration）→ startup：默认逐个执行入口模块（`getChunkEntryModulesWithChunkGroupIterable`，`:1205-1322`）。
+  - 非 runtime chunk 的文件外壳由 `ArrayPushCallbackChunkFormatPlugin`（`lib/javascript/ArrayPushCallbackChunkFormatPlugin.js:43-78`，按 `output.chunkFormat` 在 `lib/WebpackOptionsApply.js:194-195` 应用）包裹成 `(globalThis["webpackChunk..."] = ... || []).push([[chunkIds], { ...模块工厂... }])`——与 7.5 的 `webpackJsonpCallback` 对应。
+- **共享模块的形成/复用条件**（实测对照，7.8）：
+  - 默认 `optimization.splitChunks.chunks: "async"`（`lib/config/defaults.js:1573`）：splitChunks 只处理异步 chunk，两个入口间的静态共享**不去重**——`shared` 的模块工厂同时打进 a.js 和 b.js（同一 module id、各自独立的 module cache）。
+  - `splitChunks.chunks: "all"` 且体积过 `minSize`（开发默认 10000 字节，`:1576`；实测需 `minSize: 0` 才对玩具模块生效）：`default` cacheGroup（`minChunks: 2`，`:1585-1590`）把 `shared.js` 抽到独立 chunk（实测产出 `shared_js.js`，同样是 push 格式的非 runtime chunk）；`defaultVendors`（`test: node_modules`，`:1591-1596`）处理来自 node_modules 的共享。`SplitChunksPlugin` 挂在 `compilation.hooks.optimizeChunks`（`lib/optimize/SplitChunksPlugin.js:833`，即 3.5 节第 5 步的循环里）。
+  - 抽包后的连带效应（实测）：b 的入口 chunk 现在需要在执行入口前确保 `shared_js` 已加载，b.js 因此**也获得了 chunk 装载运行时**（`installedChunks` 出现）——抽取共享 chunk 会把原本"自包含"的入口变成多 chunk 入口。
+  - 异步侧复用：同一 `webpackChunkName` 合并（7.3）；`webpackMode: "eager"` 不产生异步 chunk；`reuseExistingChunk: true` 允许抽包时并入已存在 chunk。
+- 最后经第 4 节的 `emitAssets` 写盘。
+
+### 7.7 哪些只在构建期、哪些被翻译进 emitted runtime
+
+| 只存在于构建期 compiler 域 | 被翻译进 emitted runtime 的信息 |
+| --- | --- |
+| `Dependency` 对象（`HarmonyImportSideEffectDependency`/`HarmonyImportSpecifierDependency`/`ImportDependency`） | 依赖的**替换文本**：`__webpack_require__(moduleId)` 声明、`importVar.x` 属性访问、`__webpack_require__.e(chunkId).then(...)` |
+| `AsyncDependenciesBlock`（`groupOptions`/`webpackChunkName`） | block→chunk 的关系：调用点里的 **chunkId 字符串**；`webpackChunkName` 只以注释与（命名的）chunk id/文件名存在 |
+| `ModuleGraph` / `ModuleGraphConnection` | 模块 id→工厂函数的 `__webpack_modules__` 表；exports 使用信息（重命名、namespace 包装、`createFakeNamespaceObject` 的 bit 标记） |
+| `Chunk`/`ChunkGroup`/`ChunkGraph` | `__webpack_require__.u` 的 chunkId→URL 映射；`installedChunks` 初始表；`chunkLoadingGlobal` 的 push 协议 |
+| `CodeGenerationResults`、`runtimeRequirements` 集合 | `RuntimeModule` 生成的 `__webpack_require__.*` 函数族（`.e`/`.f.j`/`.l`/`.p`/`.u`…）；`__webpack_require__` 本体与 module cache（`renderRequire`） |
+| `AsyncQueue`、`NormalModuleFactory`、`ResolverFactory` 等 | —（不进入产物） |
+
+浏览器执行路径（本场景，web target）：加载 a.js → runtime modules 初始化 `installedChunks`/`__webpack_require__.f.j` → startup 执行 `./a.js` → 静态 `shared` 经 `__webpack_require__` 命中本 bundle 内副本 → 执行到 `import()`：`__webpack_require__.e("lazy-chunk")` → `f.j` 查 `installedChunks`，未装载则建 Promise 并插入 `<script src=__webpack_require__.p + __webpack_require__.u("lazy-chunk")>` → `lazy-chunk.js` 执行 push → `webpackJsonpCallback` 把工厂并入 `__webpack_modules__` 并 resolve → `.then(__webpack_require__.bind(__webpack_require__, "./lazy.js"))` 取到命名空间执行 `m.lazy()`。
+
+### 7.8 本章运行期核对（临时脚本，仓库外临时目录；工具见第 9 节）
+
+- 默认配置（`splitChunks.chunks: "async"`）：产物 `a.js`、`b.js`、`lazy-chunk.js` 三个文件。a.js 同时含 `shared` 模块工厂、`__webpack_require__.e(/*! import() | lazy-chunk */ "lazy-chunk").then(__webpack_require__.bind(__webpack_require__, /*! ./lazy */ "./lazy.js"))` 调用点、`__webpack_require__.f.j = ` 与 `installedChunks`；b.js 含 `shared` 模块工厂但无任何 chunk 装载运行时；`lazy-chunk.js` 为 `(...webpackChunk...).push([[...], ...])` 包裹格式。→ 证实 7.3/7.4/7.5/7.6 的默认行为。
+- `splitChunks: { chunks: "all", minSize: 0 }`：多出 `shared_js.js`（含 `shared` 工厂、push 格式），a.js/b.js 不再含 `shared` 工厂；b.js 新出现 `installedChunks`（抽包后入口需先确保共享 chunk 装载）。→ 证实 7.6 的条件讨论。
+- 默认 `minSize`（development 10000）会阻止玩具尺寸模块被抽包，这是 `chunks: "all"` 下"没有反应"的常见原因。
+- 未做：production 模式、`optimization.runtimeChunk: true`、context import（非字面量）的运行期核对（结论仍属静态阅读）。
+
+---
+
+## 8. 未证实 / 待核对清单
 
 以下内容本轮**未逐行核对或无法从当前版本确认**，后续按需要补读：
 
@@ -276,11 +382,11 @@ profile 汇总 → `_computeAffectedModules` → `hooks.finishModules.callAsync(
 6. `lib/config/target.js` 的 browserslist 解析细节（只确认函数名与调用点）。
 7. `processRuntimeRequirements` 中 module 级收集段（`:3708-3800` 前段）的逐行逻辑。
 8. `lib/index.js` 的全部 lazy 导出清单（只读头部 120 行）。
-9. 除第 8 节已核对的运行期行为外，其余调用顺序结论来自静态阅读。
+9. 除第 9 节已核对的运行期行为外，其余调用顺序结论来自静态阅读。
 
 ---
 
-## 8. 核对记录
+## 9. 核对记录
 
 - [x] 源码逐行阅读：`lib/webpack.js`、`lib/Compiler.js`、`lib/Compilation.js`（主链路）、`lib/config/{normalization,defaults}.js`、`lib/WebpackOptionsApply.js`、`lib/EntryOptionPlugin.js`、`lib/EntryPlugin.js`、`lib/DynamicEntryPlugin.js`、`lib/node/NodeEnvironmentPlugin.js`、`lib/Watching.js`、`lib/Cache.js`、`lib/NormalModuleFactory.js`（主链路段）、`lib/buildChunkGraph.js`（结构）、`lib/ModuleGraph.js`/`lib/ChunkGraph.js`（结构与静态反查）、`lib/validateSchema.js`、`lib/MultiCompiler.js`（部分）、`lib/javascript/JavascriptModulesPlugin.js`（hook 挂点）。
 - [x] `yarn install --frozen-lockfile`（Yarn 1.22.22，lockfile 未变；安装后 `git status` 仍只有本文件一个改动）。
@@ -290,4 +396,6 @@ profile 汇总 → `_computeAffectedModules` → `hooks.finishModules.callAsync(
   - 实测 `compilation` hook 触发时 `compilation.moduleGraph` 已存在、`compilation.chunkGraph` 为 `undefined`；`compilation.hooks.seal` 触发时 `chunkGraph` 已创建——与 3.6 节"可用时机"一致。
   - 产物 `bundle.js` 实际写出（emit 域工作正常），`stats.hasErrors() === false`。
   - 创建期 hooks（`environment`/`afterEnvironment`/`afterPlugins`/`afterResolvers`/`initialize`）在 `webpack()` 返回前已触发，返回后再 tap 捕获不到——与 2.3 节顺序一致。
+- [x] 第 7 章（场景追踪）源码阅读：`lib/dependencies/{ImportPlugin,ImportParserPlugin,ImportDependency,HarmonyModulesPlugin,HarmonyImportDependency,HarmonyImportSpecifierDependency,HarmonyImportDependencyParserPlugin}.js`、`lib/AsyncDependenciesBlock.js`、`lib/RuntimeTemplate.js`（`importStatement`/`moduleNamespacePromise`/`blockPromise`）、`lib/RuntimePlugin.js`、`lib/runtime/{EnsureChunkRuntimeModule,GetChunkFilenameRuntimeModule}.js`、`lib/web/{JsonpChunkLoadingPlugin,JsonpChunkLoadingRuntimeModule}.js`、`lib/javascript/{EnableChunkLoadingPlugin,ArrayPushCallbackChunkFormatPlugin,JavascriptModulesPlugin}.js`（render/renderMain/renderRequire）、`lib/buildChunkGraph.js`（`iteratorBlock`/队列处理段）、`lib/optimize/SplitChunksPlugin.js`（hook 挂点）、`lib/Chunk.js`（`hasRuntime`）。
+- [x] 第 7 章场景运行期冒烟：两入口 + 共享模块 + 带 `webpackChunkName` 的动态 `import()`，development 默认配置与 `splitChunks: { chunks: "all", minSize: 0 }` 各构建一次，结果见 7.8（全部通过，临时脚本已删除）。
 - 未做：watch 模式与 filesystem 缓存的运行期核对（覆盖第 5 节，仍属静态阅读结论）。
