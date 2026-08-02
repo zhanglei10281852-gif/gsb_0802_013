@@ -317,7 +317,210 @@
 
 因此写入产物 runtime 域的 JavaScript 字符串/Buffer 在这里才真正落盘。
 
-## 4. 具体场景：两个入口、一个共享模块、一个普通动态 `import()`
+## 4. 模块构建前：factory、resolve、rule 与 loader-runner
+
+前面主链路只说到 `_factorizeModule()` 调 factory，factory 返回模块后进入 `_addModule()` 和 `_buildModule()`。线上 rule、resolve、loader 的问题大多发生在这两步之间：`NormalModuleFactory` 还没有创建 `NormalModule` 时解析 request/resource/loaders；创建后由 [NormalModule.build](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L1175-L1370) 调 loader-runner，再 parse 和生成 snapshot。
+
+### 4.1 `create()`：从 dependency 到 `resolveData`
+
+[NormalModuleFactory.create](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModuleFactory.js#L869-L953) 是 `_factorizeModule()` 的入口。它从 `ModuleFactoryCreateData` 中取：
+
+- `dependencies[0].request` 作为 `request`；
+- `dependencies[0].category` 作为 `dependencyType`；
+- `data.context` 或 factory context 作为 `context`；
+- `resolveOptions`、`contextInfo`、assertions。
+
+它新建三个空集合：`fileDependencies`、`missingDependencies`、`contextDependencies`，随后构造 [ResolveData](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModuleFactory.js#L881-L895)：
+
+- `request`：原始请求，例如 `"./shared"`、`"style-loader!css-loader!./a.css"` 或带 scheme 的 `"data:..."`；
+- `dependencies`：同一 factory 请求携带的 dependencies；
+- `createData`：后续创建 NormalModule 的数据；
+- `cacheable`：默认 true，若 `beforeResolve` 或 `factorize` 抛错会在错误回调中置为 false。
+
+执行顺序是：
+
+1. 异步 bail hook `beforeResolve`；返回 false 表示 ignore，可带 `ignoredModule`。
+2. 异步 bail hook `factorize`。
+3. 内建 `factorize` tap 再调 `resolve`、`afterResolve`、`createModule`、`createModuleClass`，最后同步 waterfall `module` 返回创建好的模块。
+
+这些 hook 的类型见 [NormalModuleFactory.hooks](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModuleFactory.js#L274-L311)。
+
+### 4.2 `resolve`：request、resource、loaders 如何确定
+
+内建 [resolve hook](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModuleFactory.js#L419-L853) 是 rule 和 loader 解析核心。
+
+#### A. 解析前缀和 inline loader 前缀
+
+它先识别 request 上的 scheme、`!=!` matchResource 和 inline loader 前缀：
+
+- `-!`：禁用 pre/post loaders，但保留 normal loaders；
+- `!`：禁用普通 auto loaders；
+- `!!`：禁用 pre/post/normal auto loaders；
+- `resource!=!loader!resource`：设置 `matchResource`，用于把某份虚拟资源当作 rule 匹配对象，但实际读取另一个 resource；见 [normalization](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModuleFactory.js#L449-L514)。
+
+没有这些前缀时，request 按 `!+` split，最后一个元素是 `unresolvedResource`，前面的元素是 inline loader elements，见 [NormalModuleFactory.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModuleFactory.js#L483-L505)。
+
+#### B. 解析 inline loaders 和 resource
+
+- inline loaders 通过 `loaderResolver` 解析，结果进入 `loaders`；
+- 普通 resource 通过 normal resolver 解析；resolve context 中传入的 file/missing/context dependencies 会被 enhanced-resolve 填充；见 [resolveResource](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModuleFactory.js#L963-L1029)。
+- 带 scheme 的 request 走 `resolveForScheme`；context scheme 走 `resolveInScheme`。
+
+解析成功后得到：
+
+- `resourceData.resource`：真正读取的资源，等于 resolved path + query + fragment；
+- `resourceData.path/query/fragment`：拆分后的 resource 各部分；
+- `resourceData.data`：enhanced-resolve 返回的 resolve data。
+
+#### C. 执行 rules 并合并 use/pre/post loaders
+
+若没有 matchResource，普通资源继续执行 `ruleSet.exec()`，输入包括：
+
+- `resource`、`realResource`、`resourceQuery`、`resourceFragment`；
+- `scheme`、`mimetype`、`dependency`、`issuer`、`issuerLayer`、`compiler` 等；见 [ruleSet.exec](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModuleFactory.js#L591-L610)。
+
+rules 返回的 effect 被分到：
+
+- `useLoadersPost`；
+- `useLoaders`（normal）；
+- `useLoadersPre`；
+- 以及 type、sideEffects、parser、generator、resolve、layer 等 settings。
+
+这些 loader 都用 loader resolver 解析。若 request 带 `!!`/`!`/`-!`，对应 auto loaders 会被跳过，见 [use 合并](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModuleFactory.js#L617-L628)。
+
+#### D. 最终 loader 顺序
+
+所有 loader 解析完成后，[continueCallback](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModuleFactory.js#L655-L713) 组装最终数组。对非 matchResource：
+
+- post loaders；
+- request 内联 loaders；
+- rule normal loaders；
+- pre loaders。
+
+对 matchResource，则把 rule normal loaders 放在内联 loaders 前面，因为 normal rules 作用于 matchResource。这个数组就是 `NormalModule.loaders`，也是 loader-runner normal 阶段的输入顺序。
+
+### 4.3 创建 NormalModule、parser、generator
+
+当 `afterResolve` 没有返回 false，`createModule` 没有返回自定义模块时，factory 会按 `settings.type` 查 `createModuleClass` hook；默认没有自定义模块类时 new [NormalModule](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L337-L380)。创建数据在 [createData](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModuleFactory.js#L683-L708) 中设置，关键字段包括：
+
+- `request`：所有 loader 和最终 resource 字符串化后的完整请求；
+- `userRequest`：用户意图请求，可能包含 matchResource 前缀；
+- `rawRequest`：dependency 原始 request；
+- `loaders`；
+- `resource`；
+- `matchResource`；
+- `resourceResolveData`；
+- `parser`/`parserOptions` 和 `generator`/`generatorOptions`。
+
+parser/generator 通过 `NormalModuleFactory.getParser/getGenerator` 获取并缓存，见 [NormalModuleFactory.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModuleFactory.js#L1256-L1326)。JavaScript parser 和 generator 由 [JavascriptModulesPlugin](file:///e:/newGsb/questions/GSB-013/Tony/lib/dependencies/HarmonyModulesPlugin.js#L49-L137) 注册。
+
+### 4.4 `NormalModule.build()`：重置状态并进入 `_doBuild()`
+
+每次需要构建时，[build](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L1175-L1370) 会先清空模块自身状态：
+
+- `_source`、`_ast`、error/warnings；
+- `clearDependenciesAndBlocks()` 清掉上一轮 `Dependency` 和 `AsyncDependenciesBlock`；
+- 重建空 `buildMeta` 和新的 `buildInfo`，初始 `cacheable:false`。
+
+这很重要：如果模块因 snapshot 失效而 rebuild，parser 生成的 dependency/block 不会复用上一轮对象；会重新 parse 并重新写入新的模块图边。但模块对象本身可能来自 `Compilation/modules` cache，因此 `build()` 必须显式清理旧状态。
+
+随后调用 [_doBuild](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L916-L1087)。
+
+### 4.5 loader context 与 hook 边界
+
+`_doBuild()` 先通过 [_createLoaderContext](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L594-L844) 创建 loader context。它包含 webpack 注入的 API：
+
+- `getOptions(schema)`：读取当前 loader options 并可选校验；
+- `emitWarning`/`emitError`；
+- `resolve`/`getResolve`；
+- `emitFile`；
+- `addBuildDependency`；
+- `addDependency`/`addContextDependency`/`addMissingDependency` 通过 resolve context 的 Set adder 进入 loader-runner 的依赖集合；见 [getResolveContext](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L603-L625)；
+- `fs`、`utils`、`mode`、`sourceMap`、hash 参数。
+
+loader 相关的 compilation hook 在 [NormalModule.getCompilationHooks](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L275-L331)：
+
+- `loader`：同步，loaderContext 创建后、runLoaders 前调用，可给 context 加字段或包装 API；
+- `beforeLoaders`：同步，可检查/修改 `this.loaders`；
+- `readResource`/`readResourceForScheme`：可替换资源读取；
+- `processResult`：同步 waterfall，可改写 loader-runner 返回的 result；
+- `beforeParse`、`beforeSnapshot`、`needBuild`。
+
+这些是 loader/plugin 能观察或改变模块构建的边界。compiler 级插件还能通过 `NormalModuleFactory.hooks.beforeResolve/resolve/afterResolve/createModule/module` 影响模块创建，但那时 loader-runner 尚未执行。
+
+### 4.6 loader-runner：pitch 与 normal 顺序
+
+`_doBuild()` 调用 [runLoaders](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L1013-L1086)，传入：
+
+- `resource: this.resource`；
+- `loaders: this.loaders`；
+- `context: loaderContext`；
+- `processResource`：实际资源读取逻辑。默认读取 `loaderContext.resource`，但 scheme 可通过 `hooks.readResource` 覆盖；见 [processResource](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L1023-L1041)。
+
+根据 [LoaderContext 类型](file:///e:/newGsb/questions/GSB-013/Tony/declarations/LoaderContext.d.ts#L98-L240) 和 loader-runner 的 loader 数组约定：
+
+- pitch 阶段按 loader 数组从左到右执行，即 pre -> inline -> normal -> post；
+- normal 阶段按相反方向执行，即 post -> normal -> inline -> pre；
+- 每个 loader 在 pitch 阶段可以读写 `loaderContext.loaders`；
+- `loaderContext.remainingRequest`、`previousRequest`、`currentRequest`、`resourcePath`、`resourceQuery`、`resourceFragment` 会随当前 loaderIndex 变化。
+
+为什么 normal 阶段反向执行？因为 pipeline 的输入输出是嵌套的：最左侧 pre loader 应当最先看到最终资源处理结果，并在最后输出给 webpack；post loader 最靠近原始资源读取结果，因此先执行 normal 处理。webpack 中最终结果由 loaderIndex 0 对应的 loader（数组最左侧）返回给 webpack，这与 [processResult 检查 final loader](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L953-L965) 一致。
+
+若某 pitch loader 向 `callback` 返回非空内容，loader-runner 会把该内容作为该位置结果，跳过其右侧 loaders 的 normal 执行，也跳过对剩余 resource 的读取；具体实现属于 loader-runner 包，当前仓库未包含其源码，标为“实现来自 loader-runner，按 webpack 类型和 runLoaders 调用点确认”。在 webpack 侧能确认的是：runLoaders 返回的 result 直接经 `processResult` 进入 NormalModule；若没有 result，`buildInfo.cacheable` 会被置 false 并报 `No result from loader-runner processing`，见 [NormalModule.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L1043-L1059)。
+
+### 4.7 loader 返回 source/map/AST、错误、cacheable 与依赖
+
+runLoaders 完成后，webpack：
+
+1. 清理 loaderContext 上对 compiler/compilation/module/fs 的引用，避免 IC 泄漏；见 [NormalModule.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L1043-L1050)。
+2. 若 result 不存在，标记 cacheable=false 并进入错误处理。
+3. 把 loader-runner 返回的 `fileDependencies`、`contextDependencies`、`missingDependencies` 加入 `buildInfo`；见 [NormalModule.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L1061-L1075)。
+4. 把每个 loader 的路径加入 `buildDependencies`；见 [NormalModule.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L1076-L1082)。
+5. `buildInfo.cacheable = buildInfo.cacheable && result.cacheable`。
+6. 用 result 的 content/sourceMap/additionalData 调 `processResult`。
+
+[processResult](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L930-L987) 要求最终 content 是 string 或 Buffer，否则产生 `ModuleBuildError`。它随后：
+
+- 用 [createSource](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L872-L905) 把内容和 source map 包成 `RawSource`、`OriginalSource` 或 `SourceMapSource`，写入 `this._source`；
+- 若第三个参数含 `webpackAST`，写入 `this._ast`，parser 可直接使用而无需重新 parse。
+
+loader 抛错、`callback(err)` 或 `async()(err)` 都会变成 [ModuleBuildError](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L930-L944)。loader 还可 `emitError/emitWarning`，这些成为模块级 `ModuleError/ModuleWarning`，不会直接中断 build。
+
+关于 cache/snapshot：
+
+- `this.cacheable(false)` 或 `result.cacheable=false` 会导致 [needBuild](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L1540-L1592) 直接返回 true，下一轮必然 rebuild，也不会创建 snapshot。
+- 若 loader 声明的依赖不稳定，例如漏掉 `addDependency`，snapshot 不包含该文件，文件变化时旧 source/AST 可能被复用；这是“改了却复用旧结果”的常见原因。
+- `addBuildDependency(loaderOrConfig)` 影响 filesystem pack 恢复；loader 文件变化会让 buildDependencies snapshot 失效，整个 pack 不恢复，从而强制重新解析和构建。
+- `addMissingDependency()` 记录构建时不存在的路径；该路径后来出现会使 existence 变化，模块 rebuild。
+- `addContextDependency()` 记录目录；目录 timestampHash/hash 变化会使模块 rebuild。
+
+### 4.8 parser 和 generator 的边界
+
+loader-runner 返回后，NormalModule：
+
+1. 调 `hooks.beforeParse`；
+2. 检查 `module.noParse`；若命中，不 parse，保留 source，直接进入 hash 和 snapshot；见 [noParse](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L1343-L1352)。
+3. 否则用 `this.parser.parse(this._ast || source, { source, current: this, module: this, compilation, options })` 解析，见 [parse call](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L1354-L1367)。
+
+parser 期间生成的 `Dependency`、`AsyncDependenciesBlock`、buildMeta/buildInfo 都挂在该 NormalModule 上，并在后续 `processDependencies` 中变成 `ModuleGraphConnection`。若 parse 抛错，会生成 `ModuleParseError`。
+
+generator 不在 `build()` 中执行；它在 code generation 阶段被 `module.codeGeneration()` 调用。也就是说：
+
+- build 阶段负责产出 source/AST、dependencies、buildMeta/buildInfo 和 snapshot；
+- seal/codegen 阶段才使用 generator 把 source+dependency templates 转成最终 runtime source；
+- 若只改 generator/template 而模块 source 和 dependencies 未变，模块可能不 rebuild，但 codegen/asset cache 的 etag 应变化，导致重新生成或写出资产；否则说明 etag 未覆盖该变化。
+
+### 4.9 factory/loader 问题与三个执行域
+
+用前几节的三个执行域看这一段：
+
+- **构建期 compiler 域**：NormalModuleFactory、resolver、rules、loaders、NormalModule、parser 生成的 dependencies/blocks、snapshot 都在这里；它们不会出现在浏览器 runtime 中。
+- **写入产物的 runtime 域**：generator、dependency templates 和 runtime modules 把构建期 dependencies 翻译成 `__webpack_require__`、`__webpack_require__.e`、namespace promise 等 emitted source；loader 生成的 source 只是这一阶段的输入。
+- **watch/cache 域**：snapshot 记录 loader 登记的 file/context/missing dependencies 和 buildDependencies；filesystem cache 还额外受 cache version 与 buildDependencies 控制。
+
+因此排查线上问题时要先定位发生在哪个边界：resolve/rule 错误通常在 `beforeResolve/resolve/afterResolve`；loader 结果或依赖登记错误通常在 `loader/beforeLoaders/readResource/processResult`；旧结果复用要检查 `cacheable`、snapshot、buildDependencies 和 codegen/asset etag，而不是只看文件 mtime。
+
+## 5. 具体场景：两个入口、一个共享模块、一个普通动态 `import()`
 
 本节固定一个最小场景，说明“源码里的一条 import”怎样穿过第一版定义的三个执行域：
 
@@ -527,7 +730,7 @@ __webpack_require__.e(/* import() */ <asyncChunkId>).then(__webpack_require__.bi
 - `splitChunks`、`runtimeChunk`、module concatenation、usedExports/providedExports 等优化可能在 `seal()` 后续 hooks 中改变 chunk 成员和生成代码；本文确认的是它们的 hook 插槽，具体每个优化插件的行为列入未证实范围或需后续单独展开。
 
 
-## 5. 写入产物的 runtime 如何形成
+## 6. 写入产物的 runtime 如何形成
 
 “产物 runtime”与构建期 `compiler` 不是同一层。构建期由插件决定需要哪些 runtime requirements，generator/render 再把它们转成 bundle 源码。
 
@@ -549,7 +752,7 @@ JavaScript 渲染由 [JavascriptModulesPlugin](file:///e:/newGsb/questions/GSB-0
 
 所以最终 bundle runtime 是 `RuntimeModule`、普通模块生成结果、dependency templates、bootstrap/render 代码共同组成的 `Source`，再由 `Compilation.createChunkAssets()` 放入 `compilation.assets`，最后由 `Compiler.emitAssets()` 写出。
 
-## 6. watch/cache 域的失效与复用边界
+## 7. watch/cache 域的失效与复用边界
 
 前几节的 `Compiler`、`Compilation`、parser、`ModuleGraph`、`ChunkGraph` 和 emitted runtime 都属于单次构建中的对象。watch/cache 域要解决的是：这些对象在下一轮构建里哪些能跨轮保留，哪些必须重新解析、重新建图、重新生成或重新写出。
 
@@ -738,7 +941,7 @@ item 读取走 [restore](file:///e:/newGsb/questions/GSB-013/Tony/lib/cache/Pack
 5. 插件是否在 `watchRun`、`normalModuleFactory`、`needBuild` 等 hook 中强制 invalidate 或修改 value cache versions；
 6. 是否是编译中连续保存触发 `Watching.invalid`，导致上一轮结果被丢弃。这不是复用错误，而是调度层主动重编译。
 
-## 7. hook 短路、异步边界和多轮编译要点
+## 8. hook 短路、异步边界和多轮编译要点
 
 - `compiler.hooks.shouldEmit`：`SyncBailHook`，返回 `false` 跳过 `emitAssets()`，但不跳过 `done`。
 - `compiler.hooks.entryOption`：`SyncBailHook`，内建 `EntryOptionPlugin` 返回 `true` 后短路。
@@ -752,7 +955,7 @@ item 读取走 [restore](file:///e:/newGsb/questions/GSB-013/Tony/lib/cache/Pack
 - `Compilation.hooks.afterHash` 位于部分延后 code generation jobs 之前；涉及 full hash runtime module 时要特别注意。
 - watch 模式下 `Watching.invalid` 可以让正在进行的 emit/done 结果不汇报，直接进入下一轮编译。
 
-## 8. 未证实范围
+## 9. 未证实范围
 
 以下内容本轮没有逐行确认，后续接手时不要把本文当作这些细节的最终结论：
 
