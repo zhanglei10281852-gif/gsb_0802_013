@@ -317,7 +317,217 @@
 
 因此写入产物 runtime 域的 JavaScript 字符串/Buffer 在这里才真正落盘。
 
-## 4. 写入产物的 runtime 如何形成
+## 4. 具体场景：两个入口、一个共享模块、一个普通动态 `import()`
+
+本节固定一个最小场景，说明“源码里的一条 import”怎样穿过第一版定义的三个执行域：
+
+- `entry-a.js`：静态 `import "./shared.js"`，随后调用 `import("./async.js")`。
+- `entry-b.js`：静态 `import "./shared.js"`。
+- `shared.js`：普通共享模块。
+- `async.js`：只被普通动态 `import()` 引用的异步模块。
+
+默认 web target 会启用异步 chunk 所需的 chunk loading。两个入口通常各自产生初始 runtime chunk；若没有 `optimization.splitChunks` 或共享 runtime 配置，`shared.js` 会同时进入两个入口初始 chunk，而不是自动抽成一个独立共享 chunk。`async.js` 则会形成一个由入口 A 父子关系指向的异步 chunk。
+
+### 4.1 parser 阶段：源码 import 变成构建期 Dependency/Block
+
+**静态 `import "./shared.js"` 属于构建期 compiler 域。** JS parser 由 [HarmonyImportDependencyParserPlugin](file:///e:/newGsb/questions/GSB-013/Tony/lib/dependencies/HarmonyImportDependencyParserPlugin.js#L109-L147) 处理：
+
+- `parser.hooks.import` 为 import 语句生成一个清空原语句范围的 `ConstDependency`，再生成 [HarmonyImportSideEffectDependency](file:///e:/newGsb/questions/GSB-013/Tony/lib/dependencies/HarmonyImportSideEffectDependency.js)，并通过 `parser.state.module.addDependency()` 加入当前模块的 `dependencies`。
+- `parser.hooks.importSpecifier` 记录 imported binding 与 source 的 tag 信息；真正访问导入绑定时，`expression`、`expressionMemberChain`、`callMemberChain` 等 hook 再生成 [HarmonyImportSpecifierDependency](file:///e:/newGsb/questions/GSB-013/Tony/lib/dependencies/HarmonyImportSpecifierDependency.js)。
+
+因此在 `entry-a.js` 和 `entry-b.js` 中，指向 `shared.js` 的静态 import 最终都是当前 `Module.dependencies` 上的边；它不会创建 `AsyncDependenciesBlock`。[DependenciesBlock](file:///e:/newGsb/questions/GSB-013/Tony/lib/DependenciesBlock.js#L29-L64) 明确区分普通 `dependencies` 和用于 code-splitting 的 `blocks`。
+
+**普通动态 `import("./async.js")` 同时产生一个异步边界。** [ImportParserPlugin](file:///e:/newGsb/questions/GSB-013/Tony/lib/dependencies/ImportParserPlugin.js#L47-L335) 在 `parser.hooks.importCall` 中解析 magic comment：
+
+- 默认 `mode` 来自 parser options 的 `dynamicImportMode`；普通字符串参数且不是 `eager` 或 `weak` 时，会 new [AsyncDependenciesBlock](file:///e:/newGsb/questions/GSB-013/Tony/lib/AsyncDependenciesBlock.js#L24-L41)；
+- block 的 `groupOptions` 来自 `webpackChunkName`、`webpackPrefetch`、`webpackPreload`、`webpackFetchPriority` 等注释；
+- 再 new [ImportDependency](file:///e:/newGsb/questions/GSB-013/Tony/lib/dependencies/ImportDependency.js#L25-L139)，把它 `depBlock.addDependency(dep)`，最后 `parser.state.current.addBlock(depBlock)`；见 [ImportParserPlugin.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/dependencies/ImportParserPlugin.js#L281-L300)。
+
+所以本例中：
+
+- `entry-a`、`entry-b` 的根 `DependenciesBlock.dependencies` 都有指向 `shared` 的 Harmony dependency；
+- `entry-a` 的根 `DependenciesBlock.blocks` 有一个 `AsyncDependenciesBlock`；
+- 该 block 的 `dependencies` 里有指向 `async` 的 `ImportDependency`。
+
+这些对象只存在于构建期 compiler 域。浏览器不会执行 `Dependency` 或 `AsyncDependenciesBlock` 类；它们在后续图构建和 code generation 中被翻译成 chunk 关系和运行时代码。
+
+### 4.2 factorize/build 阶段：Dependency 变成 `ModuleGraphConnection`
+
+依赖处理仍由第一版主链路中的 `handleModuleCreation()`、`_factorizeModule()`、`_addModule()`、`_buildModule()`、`_processModuleDependencies()` 队列完成，见 [Compilation.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compilation.js#L1935-L2162)。
+
+关键转换是：
+
+1. factory 根据 dependency 创建 `shared` 和 `async` 模块；普通 JS 走 [NormalModuleFactory](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModuleFactory.js#L869-L953)。
+2. `handleModuleCreation()` 在模块 add 后调用 [ModuleGraph.setResolvedModule](file:///e:/newGsb/questions/GSB-013/Tony/lib/ModuleGraph.js#L213-L243)。它为每条 dependency 创建 `ModuleGraphConnection`：
+   - 对 `entry-a -> shared`、`entry-b -> shared`，这是两条 incoming connection，目标都是同一个 `shared` Module；
+   - 对 `entry-a -> async`，connection 的 dependency 属于 `AsyncDependenciesBlock`，不是根 block。
+3. `_processModuleDependencies()` 遍历 `block.dependencies` 和 `block.blocks`。它调用 [ModuleGraph.setParents](file:///e:/newGsb/questions/GSB-013/Tony/lib/ModuleGraph.js#L176-L187) 记录 dependency 的 parent block/module，再按 factory 分组递归创建后续模块；见 [Compilation.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compilation.js#L1593-L1664)。
+
+构建结束但尚未 seal 时，图中已有一个 `ModuleGraph`：
+
+- 节点：`entry-a`、`entry-b`、`shared`、`async`；
+- 静态边：`entry-a -> shared`、`entry-b -> shared`；
+- 异步 block 边：`entry-a.blocks[] -> AsyncDependenciesBlock -> async`；
+- 此时还没有 `ChunkGraph`，也没有 chunk。
+
+### 4.3 seal/`buildChunkGraph`：从模块图到初始 chunk 和异步 chunk
+
+`Compilation.seal()` 开始时创建 [ChunkGraph](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compilation.js#L3062-L3072)。随后它为每个 entry 创建初始 chunk 和 `Entrypoint`，把入口模块连接为 entry module，再调用 [buildChunkGraph](file:///e:/newGsb/questions/GSB-013/Tony/lib/buildChunkGraph.js#L1301-L1357)。
+
+对本例要抓住三个动作。
+
+第一，两个入口各自入队初始模块。入口信息来自 seal 阶段创建的 `chunkGraphInit`，`visitModules()` 为没有 parent 的 entrypoint 设置 `minAvailableModules = 0n`，并把入口模块加入队列，见 [buildChunkGraph.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/buildChunkGraph.js#L380-L437)。队列中的 `ADD_AND_ENTER_MODULE` 会调用 [ChunkGraph.connectChunkAndModule](file:///e:/newGsb/questions/GSB-013/Tony/lib/buildChunkGraph.js#L813-L834)，因此：
+
+- chunk A 连接 `entry-a`；
+- chunk B 连接 `entry-b`。
+
+第二，静态依赖中的 `shared` 按当前 chunk group 继续处理。`processBlock()` 通过 `getBlockModules()` 读取模块图连接，并用 `minAvailableModules` 判断父级 chunks 是否已经包含某模块；见 [buildChunkGraph.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/buildChunkGraph.js#L675-L751)。由于 chunk A 和 chunk B 是两个独立入口初始 group，彼此初始时没有父子关系：
+
+- 处理 `entry-a` 的静态 `shared` dependency 时，`shared` 不在 A 的父级可用模块集合中，于是连接进 chunk A；
+- 处理 `entry-b` 的同一静态 dependency 时，`shared` 也不在 B 的父级可用模块集合中，于是连接进 chunk B。
+
+这就是“两个入口共享一个模块”在默认图构建中的结果：**同一个 Module 被两个初始 chunk 同时连接**，但没有自动形成第三个共享 chunk。若要让它抽成独立 chunk，需要 splitChunks、runtime chunk 共享或其他改变图/可用模块集合的优化；这些优化发生在 `buildChunkGraph()` 之后的 optimize hooks 中。
+
+第三，动态 `import()` 的 `AsyncDependenciesBlock` 触发异步 chunk group。处理根 block 的子 block 时，`iteratorBlock()` 发现该 block：
+
+- 若启用 `asyncChunks` 和 chunk loading，就调用 `compilation.addChunkInGroup()` 创建一个新的 `ChunkGroup` 和其中的异步 chunk；
+- 相同 `webpackChunkName` 会通过 `namedChunkGroups` 复用已有 group；
+- 该连接被记录到 `blockConnections`，并把目标 group 放入 `queueConnect`；见 [buildChunkGraph.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/buildChunkGraph.js#L483-L669)。
+
+`processConnectQueue()` 和 `processChunkGroupsForMerging()` 会把父 group 的 resulting available modules 合并进异步 group。由于初始 chunk A 已经包含 `shared`，`shared` 对 A 的异步 group 是可用模块；异步 block 再被遍历时，`processBlock()` 遇到已在父级可用集合中的模块会放入 `skippedItems`，不重复连接进异步 chunk，见 [buildChunkGraph.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/buildChunkGraph.js#L686-L744)。而 `async` 不在父级可用集合中，所以连接到新异步 chunk。
+
+最后 `connectChunkGroups()` 根据 `blockConnections` 做两件事：
+
+- [ChunkGraph.connectBlockAndChunkGroup](file:///e:/newGsb/questions/GSB-013/Tony/lib/ChunkGraph.js#L1315-L1331) 把 `AsyncDependenciesBlock` 映射到生成的 chunk group；
+- `connectChunkGroupParentAndChild()` 把入口 A 的初始 group 与异步 group 连为父子；见 [buildChunkGraph.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/buildChunkGraph.js#L1238-L1272)。
+
+因此本例默认结果是：
+
+- 初始 chunk A：`entry-a` + `shared`，父 group 是 entrypoint A；
+- 初始 chunk B：`entry-b` + `shared`，父 group 是 entrypoint B；
+- 异步 chunk C：`async`，父 group 是 entrypoint A；
+- `AsyncDependenciesBlock` 通过 `ChunkGraph.getBlockChunkGroup()` 指向 C 的 group，运行时模板据此知道要加载哪个 chunk。
+
+### 4.4 code generation：静态 import 与动态 import 的翻译方式不同
+
+code generation 由 [Compilation.codeGeneration](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compilation.js#L3467-L3499) 调度。每个普通 JS 模块最终调用 [JavascriptGenerator.generate](file:///e:/newGsb/questions/GSB-013/Tony/lib/javascript/JavascriptGenerator.js#L98-L111)。它：
+
+- 遍历 `module.dependencies` 和 `module.blocks`；
+- 为每个 dependency 从 `dependencyTemplates` 找 template；
+- 把 `runtimeRequirements` 放进 template context；
+- 用 `ReplaceSource` 改写原始源码；见 [JavascriptGenerator.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/javascript/JavascriptGenerator.js#L130-L247)。
+
+#### 静态 import：翻译成本模块内的 harmony import 语句
+
+静态 `shared` import 的 template 在 [HarmonyImportDependency.Template.apply](file:///e:/newGsb/questions/GSB-013/Tony/lib/dependencies/HarmonyImportDependency.js#L270-L370)。它会先检查 connection 在当前 runtime 是否 active，然后调用 dependency 的 `getImportStatement()`。`RuntimeTemplate.importStatement()` 生成：
+
+- `var <importVar> = __webpack_require__(<moduleId>);`
+- 必要时追加 compat default export 代码；
+- 同时把 `RuntimeGlobals.require` 加入 runtime requirements；见 [RuntimeTemplate.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/RuntimeTemplate.js#L790-L850)。
+
+`HarmonyImportSpecifierDependency.Template` 再把源码中使用的导入绑定替换成对已导入 namespace/default/named export 的成员访问，见 [HarmonyImportSpecifierDependency.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/dependencies/HarmonyImportSpecifierDependency.js#L325-L400)。
+
+所以静态 import 在 emitted runtime 中不是浏览器原生跨 chunk 加载；它被翻译成当前 chunk 内的模块注册/require 访问。因为本例默认把 `shared` 同时放入两个初始 chunk，chunk A 和 B 都能同步 `__webpack_require__(sharedId)`。
+
+#### 动态 import：翻译成 `__webpack_require__.e(chunkId).then(...)`
+
+动态 `async` import 的 template 是 [ImportDependency.Template](file:///e:/newGsb/questions/GSB-013/Tony/lib/dependencies/ImportDependency.js#L107-L137)。它通过 `moduleGraph.getParentBlock(dep)` 找回 parser 阶段创建的 `AsyncDependenciesBlock`，然后调用 [RuntimeTemplate.moduleNamespacePromise](file:///e:/newGsb/questions/GSB-013/Tony/lib/RuntimeTemplate.js#L602-L739)。
+
+这个模板的关键步骤是：
+
+1. 通过 `chunkGraph.getModuleId(module)` 取得 `async` 的模块 id；
+2. 调用 [RuntimeTemplate.blockPromise](file:///e:/newGsb/questions/GSB-013/Tony/lib/RuntimeTemplate.js#L986-L1042)；
+3. `blockPromise()` 用 [ChunkGraph.getBlockChunkGroup](file:///e:/newGsb/questions/GSB-013/Tony/lib/ChunkGraph.js#L1315-L1321) 找到异步 group，过滤掉 runtime chunk，生成 `__webpack_require__.e(<chunkId>)` 或 `Promise.all([...])`，并把 `RuntimeGlobals.ensureChunk` 加入 runtime requirements；
+4. 根据 `async` 的 exports type，再追加 `__webpack_require__.then(...)`、`createFakeNamespaceObject(...)` 等逻辑。
+
+因此入口 A 里的 `import("./async.js")` 在 emitted runtime 中会变成类似：
+
+```js
+__webpack_require__.e(/* import() */ <asyncChunkId>).then(__webpack_require__.bind(__webpack_require__, <asyncModuleId>))
+```
+
+如果目标模块的 exports type 需要 fake namespace，还会继续 `.then(m => __webpack_require__.nco(m, type))`。具体形状由 `module.getExportsType()` 决定，见 [RuntimeTemplate.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/RuntimeTemplate.js#L672-L739)。
+
+### 4.5 runtime requirements 与 `RuntimeModule`：浏览器如何真正装载异步 chunk
+
+动态 import template 只声明它需要 [RuntimeGlobals.ensureChunk](file:///e:/newGsb/questions/GSB-013/Tony/lib/RuntimeGlobals.js#L76-L81)。真正的 `__webpack_require__.e` 和脚本加载逻辑由 runtime 域的 `RuntimeModule` 生成。
+
+`seal()` 中 `processRuntimeRequirements()` 会遍历模块和树级 requirements，并触发：
+
+- `additionalModuleRuntimeRequirements`；
+- `runtimeRequirementInModule`；
+- `additionalTreeRuntimeRequirements`；
+- `runtimeRequirementInTree`。
+
+[RuntimePlugin](file:///e:/newGsb/questions/GSB-013/Tony/lib/RuntimePlugin.js#L371-L383) 监听 `runtimeRequirementInTree.for(RuntimeGlobals.ensureChunk)`：
+
+- 如果当前 chunk 有异步子 chunk，则进一步要求 `RuntimeGlobals.ensureChunkHandlers`；
+- 总是向 chunk 添加 [EnsureChunkRuntimeModule](file:///e:/newGsb/questions/GSB-013/Tony/lib/runtime/EnsureChunkRuntimeModule.js)。
+
+[EnsureChunkRuntimeModule.generate](file:///e:/newGsb/questions/GSB-013/Tony/lib/runtime/EnsureChunkRuntimeModule.js#L26-L65) 生成两种形态：
+
+- 需要加载非初始 chunk 时：`__webpack_require__.f = {}; __webpack_require__.e = function(chunkId) { return Promise.all(Object.keys(__webpack_require__.f).reduce(...)); }`；
+- 所有引用 chunk 都已在当前文件中时：`__webpack_require__.e = () => Promise.resolve()`。这在多入口场景中可能出现。
+
+默认 web/jsonp 输出中，异步脚本加载 handler 由 [JsonpChunkLoadingRuntimeModule](file:///e:/newGsb/questions/GSB-013/Tony/lib/web/JsonpChunkLoadingRuntimeModule.js#L90-L217) 生成：
+
+- `installedChunks` 记录未加载、加载中、已加载状态；
+- `__webpack_require__.f.j(chunkId, promises)` 检查 chunk 是否有 JS，创建 Promise，计算 URL，并调用 `__webpack_require__.l(url, loadingEnded, ...)`；
+- [LoadScriptRuntimeModule](file:///e:/newGsb/questions/GSB-013/Tony/lib/runtime/LoadScriptRuntimeModule.js#L58-L160) 生成创建 `<script>`、处理 onload/onerror、去重 in-progress URL 的逻辑。
+
+异步 chunk 自己的包裹格式由 [ArrayPushCallbackChunkFormatPlugin](file:///e:/newGsb/questions/GSB-013/Tony/lib/javascript/ArrayPushCallbackChunkFormatPlugin.js#L43-L137) 生成：
+
+- 非初始 chunk 输出为 `(globalThis["webpackChunk..."] = globalThis["webpackChunk..."] || []).push([chunkIds, modules, runtime])`；
+- 其中的 modules 包含 `async` 模块工厂；
+- runtime chunk 中的 [JsonpChunkLoadingRuntimeModule](file:///e:/newGsb/questions/GSB-013/Tony/lib/web/JsonpChunkLoadingRuntimeModule.js#L417-L466) 生成 `webpackJsonpCallback`，把 moreModules 写入 `__webpack_require__.m`/module factories，并把 `installedChunks[chunkId]` 置为已加载、resolve 正在等待的 Promise。
+
+因此浏览器执行顺序是：
+
+1. 加载入口 A initial chunk；
+2. 用户代码执行到 `import("./async.js")` 翻译出的 `__webpack_require__.e(asyncChunkId)`；
+3. `__webpack_require__.e` 调用 `__webpack_require__.f.j`，创建 script 标签加载异步 chunk；
+4. 异步 chunk 的 `webpackChunk.push([...])` 执行，注册 `async` 模块工厂并 resolve chunk promise；
+5. `.then(__webpack_require__.bind(__webpack_require__, asyncModuleId))` 执行模块工厂，返回模块 namespace；
+6. 若异步模块还静态依赖了已在父 chunk 可用的模块，注册工厂中同步 `__webpack_require__()` 即可取到，无需再次下载。
+
+### 4.6 三个执行域中的所有权边界
+
+**只存在于构建期 compiler 域：**
+
+- parser、`Dependency` 子类、`AsyncDependenciesBlock`、`ModuleGraphConnection`；
+- `Compilation.modules`、构建队列、factory、resolver；
+- `ModuleGraph` 的 connection/export info/profile 等内部结构；
+- `ChunkGraph` 中 block-to-group、runtime requirement bookkeeping 等大部分调度数据。
+
+这些对象不会原样写进 bundle。它们只决定模块解析、chunk 切分、id 分配、runtime requirements 和 source 替换。
+
+**被翻译进写入产物的 runtime 域：**
+
+- 静态 import -> harmony import init fragment 和 `__webpack_require__(moduleId)`；
+- 动态 import -> `AsyncDependenciesBlock` 对应 chunk id 的 `__webpack_require__.e(chunkId)` Promise；
+- module/chunk id、module factories、`installedChunks`、`__webpack_require__.f.j`、`__webpack_require__.l`、jsonp callback；
+- 必要时由 `RuntimePlugin` 和输出格式插件生成的 `RuntimeModule` 源码。
+
+**watch/cache 域复用的是构建期结构：**
+
+- 文件变化后，parser/build/cache 可能复用模块或依赖信息；
+- 每次 `compile()` 仍会新建 `Compilation`、`ModuleGraph` 和 `ChunkGraph`；
+- watch 模式可根据 `modifiedFiles/removedFiles` 和 cache 让某些模块 `stillValidModule`，但 chunk 关系仍在当次 `seal()` 中重新建立。
+
+### 4.7 共享模块和异步块形成/复用 chunk 的条件
+
+本例可作为判断基线：
+
+- 两个独立 initial entry 同时静态依赖 `shared`：同一 Module 会有两条 incoming connections，默认连接进两个初始 chunk；不会仅因“被两个入口共享”就自动抽出。
+- 初始 entry A 的动态 `import()` 指向 `async`：只要 `output.asyncChunks` 和 chunk loading 未禁用，就会创建异步 `ChunkGroup` 和 chunk；见 [buildChunkGraph.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/buildChunkGraph.js#L569-L633)。
+- 如果异步边界的目标模块已经在父级 available modules 中，则在该异步 group 中被跳过，不重复放入异步 chunk；见 [buildChunkGraph.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/buildChunkGraph.js#L707-L744)。
+- 相同 `webpackChunkName` 的异步 block 会复用同名 `ChunkGroup`；复用 initial group 会报 `AsyncDependencyToInitialChunkError`，见 [buildChunkGraph.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/buildChunkGraph.js#L580-L630)。
+- 若 `webpackMode: "eager"`，parser 不创建 `AsyncDependenciesBlock`，而是生成 `ImportEagerDependency`，因此不会产生按需 chunk；见 [ImportParserPlugin.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/dependencies/ImportParserPlugin.js#L265-L273)。
+- 若 `webpackMode: "weak"`，parser 使用 `ImportWeakDependency` 且也不创建异步 block；见 [ImportParserPlugin.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/dependencies/ImportParserPlugin.js#L273-L281)。
+- `splitChunks`、`runtimeChunk`、module concatenation、usedExports/providedExports 等优化可能在 `seal()` 后续 hooks 中改变 chunk 成员和生成代码；本文确认的是它们的 hook 插槽，具体每个优化插件的行为列入未证实范围或需后续单独展开。
+
+
+## 5. 写入产物的 runtime 如何形成
 
 “产物 runtime”与构建期 `compiler` 不是同一层。构建期由插件决定需要哪些 runtime requirements，generator/render 再把它们转成 bundle 源码。
 
@@ -339,7 +549,7 @@ JavaScript 渲染由 [JavascriptModulesPlugin](file:///e:/newGsb/questions/GSB-0
 
 所以最终 bundle runtime 是 `RuntimeModule`、普通模块生成结果、dependency templates、bootstrap/render 代码共同组成的 `Source`，再由 `Compilation.createChunkAssets()` 放入 `compilation.assets`，最后由 `Compiler.emitAssets()` 写出。
 
-## 5. watch/cache 域的边界
+## 6. watch/cache 域的边界
 
 ### 5.1 watch 复编译调度
 
@@ -383,7 +593,7 @@ development 默认 cache 是 memory，production 默认 false；见 [defaults.js
 
 filesystem cache 也通过同一 `Cache` hook 层接入，但 idle pack 策略、序列化格式和 restore/store 细节本轮未逐行追完，标为“未证实”。
 
-## 6. hook 短路、异步边界和多轮编译要点
+## 7. hook 短路、异步边界和多轮编译要点
 
 - `compiler.hooks.shouldEmit`：`SyncBailHook`，返回 `false` 跳过 `emitAssets()`，但不跳过 `done`。
 - `compiler.hooks.entryOption`：`SyncBailHook`，内建 `EntryOptionPlugin` 返回 `true` 后短路。
@@ -397,7 +607,7 @@ filesystem cache 也通过同一 `Cache` hook 层接入，但 idle pack 策略�
 - `Compilation.hooks.afterHash` 位于部分延后 code generation jobs 之前；涉及 full hash runtime module 时要特别注意。
 - watch 模式下 `Watching.invalid` 可以让正在进行的 emit/done 结果不汇报，直接进入下一轮编译。
 
-## 7. 未证实范围
+## 8. 未证实范围
 
 以下内容本轮没有逐行确认，后续接手时不要把本文当作这些细节的最终结论：
 
