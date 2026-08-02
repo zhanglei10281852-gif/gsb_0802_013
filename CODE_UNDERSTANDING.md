@@ -232,12 +232,111 @@
 
 ---
 
-## 7. 待核实 / 未证实清单（后续深入方向）
+## 8. 端到端场景：两入口共享一个模块 + 一次动态 `import()`
 
-以下为本轮**未直接读源确认**的点，标为 **未证实**，避免误导：
+维护团队最常问的问题是：“**源码里写的一条 `import` 到底怎么变成编译图、又怎么变成浏览器里跑的装载代码？**” 本节用一个具体场景把 §1–§5 的机制串成一条线，全程复用三个执行域（build-time / output-runtime / watch-cache）与对象所有权。
 
-- **未证实**：`buildChunkGraph`（[lib/buildChunkGraph.js](file:///e:/newGsb/questions/GSB-013/Thor/lib/buildChunkGraph.js)）内部把 module 分配到 chunk 的具体算法（可用/available modules 传播、`SplitChunksPlugin` 在 `optimizeChunks` 中的介入细节）尚未逐行读。
-- **未证实**：`RuntimePlugin` 如何依据 `RuntimeGlobals` 决定注入哪些 `RuntimeModule`，以及 output/runtime 域运行时的 chunk 加载协议（jsonp / import / require）细节。
+### 8.0 场景设定
+
+```js
+// entryA.js
+import { s } from "./shared";      // 静态：两入口都依赖
+import("./lazy").then(m => m.run); // 动态：只有 A 有
+
+// entryB.js
+import { s } from "./shared";      // 静态：与 A 指向同一个 shared 模块
+```
+
+配置里 `entry: { entryA: "./entryA.js", entryB: "./entryB.js" }`，**不启用** `SplitChunksPlugin` 的抽取（用默认 `optimization.splitChunks` 但 `shared` 不满足默认抽取条件，或显式关闭），以便先看清“不做任何优化时”的裸行为。
+
+预告结论：`shared` 会**同时复制进 entryA 与 entryB 两个 chunk**；`lazy` 会拿到**自己的 async chunk**；`import()` 表达式会被翻译成 `__webpack_require__.e(chunkId).then(...)`，而 `.e` / jsonp 装载器由 `RuntimeModule` 生成、打进 runtime chunk。
+
+### 8.1 第一步（build-time）：parser 把三条 import 变成 Dependency / Block
+
+模块 build 阶段（§3.3 的 `_buildModule` → `module.build` → loader/parser）里，`JavascriptParser` 遍历 AST，不同 import 形态触发不同 hook，产出**只存在于构建期**的 `Dependency`/`AsyncDependenciesBlock`，挂在 `Module` 上。存储模型：`Module extends DependenciesBlock`（[Module.js:189](file:///e:/newGsb/questions/GSB-013/Thor/lib/Module.js#L189)），`this.dependencies` / `this.blocks` 数组与 `addDependency` / `addBlock` 都来自基类（[DependenciesBlock.js:32-64](file:///e:/newGsb/questions/GSB-013/Thor/lib/DependenciesBlock.js#L32-L64)）。
+
+**静态 `import { s } from "./shared"`**（[HarmonyImportDependencyParserPlugin.js](file:///e:/newGsb/questions/GSB-013/Thor/lib/dependencies/HarmonyImportDependencyParserPlugin.js)）：
+
+- `parser.hooks.import` 每条 import 语句触发一次：创建 `new HarmonyImportSideEffectDependency(source, order, attributes)` 并 `parser.state.module.addDependency(sideEffectDep)`（[:124-130](file:///e:/newGsb/questions/GSB-013/Thor/lib/dependencies/HarmonyImportDependencyParserPlugin.js#L124-L130)）——代表“模块求值”这条边。
+- `parser.hooks.importSpecifier` 只给变量打 `harmonySpecifierTag`（[:134-147](file:///e:/newGsb/questions/GSB-013/Thor/lib/dependencies/HarmonyImportDependencyParserPlugin.js#L134-L147)），**此时不建依赖**。
+- 真正的 `HarmonyImportSpecifierDependency` 在被标记变量**被使用时**由 `parser.hooks.expression.for(harmonySpecifierTag)` 惰性创建并 `module.addDependency(dep)`（[:196-216](file:///e:/newGsb/questions/GSB-013/Thor/lib/dependencies/HarmonyImportDependencyParserPlugin.js#L196-L216)）。
+
+**关键**：静态 import **不建 block**，依赖直接挂在 Module 上——它不是代码分割点。
+
+**动态 `import("./lazy")`**（[ImportParserPlugin.js](file:///e:/newGsb/questions/GSB-013/Thor/lib/dependencies/ImportParserPlugin.js)）：
+
+- `parser.hooks.importCall` 触发（[:47](file:///e:/newGsb/questions/GSB-013/Thor/lib/dependencies/ImportParserPlugin.js#L47)）。默认 lazy 模式下：
+  - `const depBlock = new AsyncDependenciesBlock({ ...groupOptions, name: chunkName }, expr.loc, param.string)`（[:282-289](file:///e:/newGsb/questions/GSB-013/Thor/lib/dependencies/ImportParserPlugin.js#L282-L289)）；
+  - `const dep = new ImportDependency(param.string, expr.range, exports, attributes)`（[:290-295](file:///e:/newGsb/questions/GSB-013/Thor/lib/dependencies/ImportParserPlugin.js#L290-L295)）；
+  - **`depBlock.addDependency(dep)`**（[:298](file:///e:/newGsb/questions/GSB-013/Thor/lib/dependencies/ImportParserPlugin.js#L298)）把依赖装进 block；
+  - **`parser.state.current.addBlock(depBlock)`**（[:299](file:///e:/newGsb/questions/GSB-013/Thor/lib/dependencies/ImportParserPlugin.js#L299)）把 block 挂到 entryA 模块的 `this.blocks`。
+
+**`AsyncDependenciesBlock`**（[AsyncDependenciesBlock.js:24-48](file:///e:/newGsb/questions/GSB-013/Thor/lib/AsyncDependenciesBlock.js#L24-L48)）`extends DependenciesBlock`，构造签名 `(groupOptions, loc, request)`；`groupOptions.name` 即 `chunkName`（可来自 `/* webpackChunkName */`）。**它就是“分割点”**：一个 block 后续对应一个 ChunkGroup。
+
+> 域归属：`Dependency`、`AsyncDependenciesBlock` 全部是 **build-time-only**，挂在 `Module` 上，随 `Compilation` 生灭。它们经 `makeSerializable` 可进**持久化缓存**（watch/cache 域），但**绝不进 emitted runtime**——最终产物里只有它们的 `.Template` 生成的源码字符串（§8.4）。
+
+### 8.2 第二步（build-time）：ModuleGraph 记录“谁依赖谁”
+
+`make` 递归（§3.3 的 `handleModuleCreation` → `_processModuleDependencies`）对每条依赖调 `moduleGraph.setResolvedModule` / `setParents`，把上面的 Dependency 解析成指向具体 `Module` 的边。结果：
+
+- `shared` 是**同一个 `Module` 实例**（按 identifier 在 `_modules` 去重，[Compilation.js:1446](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L1446)），被 entryA、entryB 各自的 `HarmonyImportSideEffectDependency` 指向——图里是**一个节点、两条入边**。
+- `lazy` 模块由 `ImportDependency` 指向，但那条依赖被包在 `AsyncDependenciesBlock` 里；`ImportDependency.Template` 之后要靠 `moduleGraph.getParentBlock(dep)` 找回这个 block（[ImportDependency.js:122-124](file:///e:/newGsb/questions/GSB-013/Thor/lib/dependencies/ImportDependency.js#L122-L124)）。
+
+此刻（make/finish 之后、seal 之前，见 §3.4）`ModuleGraph` 完整；`ChunkGraph` 仍是 `undefined`。**ModuleGraph 只关心模块与依赖，不关心 chunk**。
+
+### 8.3 第三步（build-time）：`buildChunkGraph` 把模块铺进 chunk
+
+seal 阶段先按 entries 造出 entryA-chunk、entryB-chunk 两个入口 chunk + `Entrypoint`，塞进 `chunkGraphInit`（§3.5），再调 `buildChunkGraph(this, chunkGraphInit)`（[Compilation.js:3227](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L3227)）。算法（[buildChunkGraph.js:1301](file:///e:/newGsb/questions/GSB-013/Thor/lib/buildChunkGraph.js#L1301)）三阶段：`visitModules`（[:247](file:///e:/newGsb/questions/GSB-013/Thor/lib/buildChunkGraph.js#L247)）→ `connectChunkGroups`（[:1216](file:///e:/newGsb/questions/GSB-013/Thor/lib/buildChunkGraph.js#L1216)）→ `cleanupUnconnectedGroups`（[:1280](file:///e:/newGsb/questions/GSB-013/Thor/lib/buildChunkGraph.js#L1280)）。
+
+**`shared` 为何进两个 chunk**：entryA、entryB 是两个独立 root entrypoint，各自以 `minAvailableModules = ZERO_BIGINT`（空）入队（[:418-432](file:///e:/newGsb/questions/GSB-013/Thor/lib/buildChunkGraph.js#L418-L432)）。`processBlock`（[:675](file:///e:/newGsb/questions/GSB-013/Thor/lib/buildChunkGraph.js#L675)）遍历各自静态依赖时，`shared` 既不在本 chunk、也不在 `minAvailableModules` 里，于是走 `ADD_AND_ENTER_MODULE`，调 **`chunkGraph.connectChunkAndModule(chunk, module)`**（[:829](file:///e:/newGsb/questions/GSB-013/Thor/lib/buildChunkGraph.js#L829)）。两个 entry 之间**无父子关系**，谁都不能把 `shared` 当作“已可用”，所以 `shared` 被分别连进 **两个** entry chunk。这正是 `SplitChunksPlugin` 存在的理由——裸算法不去重。
+
+**`lazy` 为何独立成 async chunk**：`processBlock` 结尾遍历 `module.blocks`，对 entryA 的 `AsyncDependenciesBlock` 调 `iteratorBlock`（[:488](file:///e:/newGsb/questions/GSB-013/Thor/lib/buildChunkGraph.js#L488)），其中 `compilation.addChunkInGroup(...)` **新建一个 ChunkGroup + Chunk**（[:582-587](file:///e:/newGsb/questions/GSB-013/Thor/lib/buildChunkGraph.js#L582-L587)），并记进 `blockConnections`（[:643-647](file:///e:/newGsb/questions/GSB-013/Thor/lib/buildChunkGraph.js#L643-L647)），稍后 `connectChunkGroups` 把它连成 entryA 的子 group。
+
+**“available modules”去重规则**：async chunk 的 `minAvailableModules` 由父（entryA-chunk）的 `resultingAvailableModules`（= 父 minAvailable ∪ 父 chunk 内所有模块，[:894-910](file:///e:/newGsb/questions/GSB-013/Thor/lib/buildChunkGraph.js#L894-L910)）经**交集**合并得到（[:947-997](file:///e:/newGsb/questions/GSB-013/Thor/lib/buildChunkGraph.js#L947-L997)）。因此如果 `lazy` 也 import 了 `shared`，`processBlock` 里 `isOrdinalSetInMask(minAvailableModules, refOrdinal)` 命中（[:707-711](file:///e:/newGsb/questions/GSB-013/Thor/lib/buildChunkGraph.js#L707-L711)），`shared` **不会**再复制进 lazy chunk——因为它已从 entryA 父 chunk 可用。这是“共享模块/异步块何时复用 chunk”的核心判据。
+
+**`ChunkGraph` 允许一个 Module 属于多个 Chunk**：每模块记录 `ChunkGraphModule.chunks = new SortableSet()`（[ChunkGraph.js:201-202](file:///e:/newGsb/questions/GSB-013/Thor/lib/ChunkGraph.js#L201-L202)），`connectChunkAndModule` 同时往 `cgm.chunks` 和 `cgc.modules` 各加一次（[:343-348](file:///e:/newGsb/questions/GSB-013/Thor/lib/ChunkGraph.js#L343-L348)）。这就是 `shared` 能同时在两个 chunk 的数据结构基础。`ChunkGraph` 用 `WeakMap` 挂在 live 对象上（[:255-260](file:///e:/newGsb/questions/GSB-013/Thor/lib/ChunkGraph.js#L255-L260)），**build-time-only，不序列化进产物**。
+
+### 8.4 第四步（build-time → 翻译进 runtime）：code generation
+
+seal 的代码生成阶段（§3.5 第 7 步）对每个模块调 `module.codeGeneration(...)`，Dependency 的 `.Template` 负责把源码里的 import 表达式替换成 `__webpack_require__` 调用，**同时**往该模块的 `runtimeRequirements`（一个 `Set<string>`）里登记需要的 `RuntimeGlobals`：
+
+- **静态 import** → `HarmonyImportDependency.Template`（[HarmonyImportDependency.js:279](file:///e:/newGsb/questions/GSB-013/Thor/lib/dependencies/HarmonyImportDependency.js#L279)）经 `RuntimeTemplate.importStatement` 生成 `__webpack_require__(moduleId)`，并 `runtimeRequirements.add(RuntimeGlobals.require)`（[RuntimeTemplate.js:842-843](file:///e:/newGsb/questions/GSB-013/Thor/lib/RuntimeTemplate.js#L842-L843)）。**只要 require，不涉及 chunk 装载**。
+- **动态 import** → `ImportDependency.Template.apply`（[ImportDependency.js:116](file:///e:/newGsb/questions/GSB-013/Thor/lib/dependencies/ImportDependency.js#L116)）经 `moduleNamespacePromise` → `blockPromise` 生成 `__webpack_require__.e(chunkId).then(__webpack_require__.bind(__webpack_require__, moduleId))`，并 `add(RuntimeGlobals.ensureChunk)`（[RuntimeTemplate.js:1009](file:///e:/newGsb/questions/GSB-013/Thor/lib/RuntimeTemplate.js#L1009)）+ `add(RuntimeGlobals.require)`（[:690-691](file:///e:/newGsb/questions/GSB-013/Thor/lib/RuntimeTemplate.js#L690-L691)）。`chunkId` 正是 §8.3 里为 `lazy` 新建的那个 async chunk 的 id（Template 靠 `getParentBlock(dep)` → chunkGroup 找到它）。
+
+`RuntimeGlobals` 只是字符串常量：`require = "__webpack_require__"`、`ensureChunk = "__webpack_require__.e"`、`ensureChunkHandlers = "__webpack_require__.f"`（[RuntimeGlobals.js:76-81](file:///e:/newGsb/questions/GSB-013/Thor/lib/RuntimeGlobals.js#L76-L81)）。**runtimeRequirements 是构建期元数据，不是代码**——它记录“这段产物需要哪些运行时能力”，下一步才被翻译成真实运行时代码。
+
+### 8.5 第五步（build-time 决策 → output-runtime 落地）：runtime requirements 展开成 `RuntimeModule`
+
+`processRuntimeRequirements`（[Compilation.js:3708](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L3708)，seal 中 [:3328](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L3328) 调用）把各模块的 `Set<string>` 沿 module→chunk→tree 汇聚，然后对每个 requirement 通过 `runtimeRequirementInTree.for(r).call(...)`（[:3824-3828](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L3824-L3828)）扇出给插件，插件据此**追加 requirement 并注入 `RuntimeModule`**：
+
+1. `RuntimePlugin` tap `for(RuntimeGlobals.ensureChunk)`（[RuntimePlugin.js:371-380](file:///e:/newGsb/questions/GSB-013/Thor/lib/RuntimePlugin.js#L371-L380)）：若 chunk 有 async 子 chunk 就 `set.add(ensureChunkHandlers)`（[:376](file:///e:/newGsb/questions/GSB-013/Thor/lib/RuntimePlugin.js#L376)），并 `compilation.addRuntimeModule(chunk, new EnsureChunkRuntimeModule(set))`（[:378-380](file:///e:/newGsb/questions/GSB-013/Thor/lib/RuntimePlugin.js#L378-L380)）。
+2. 上一步把 `ensureChunkHandlers`（`.f`）推入 requirement 集，触发 `JsonpChunkLoadingPlugin` tap `for(RuntimeGlobals.ensureChunkHandlers)`（[JsonpChunkLoadingPlugin.js:54](file:///e:/newGsb/questions/GSB-013/Thor/lib/web/JsonpChunkLoadingPlugin.js#L54)），它 `addRuntimeModule(chunk, new JsonpChunkLoadingRuntimeModule(set))`（[:48-51](file:///e:/newGsb/questions/GSB-013/Thor/lib/web/JsonpChunkLoadingPlugin.js#L48-L51)），并追加 `publicPath` / `loadScript` 等传递性 requirement。
+
+`RuntimeModule extends Module`（[RuntimeModule.js:32-38](file:///e:/newGsb/questions/GSB-013/Thor/lib/RuntimeModule.js#L32-L38)），是真正的“模块”，有 `generate()` 产出源码。`addRuntimeModule`（[Compilation.js:3843](file:///e:/newGsb/questions/GSB-013/Thor/lib/Compilation.js#L3843)）把它加入 `this.modules` 并 `connectChunkAndModule` 连进目标 chunk（通常是 runtime chunk）。它们的 `generate()` 就是**最终打进产物、在浏览器里执行的 runtime**：
+
+- `EnsureChunkRuntimeModule.generate`（[EnsureChunkRuntimeModule.js:26](file:///e:/newGsb/questions/GSB-013/Thor/lib/runtime/EnsureChunkRuntimeModule.js#L26)）：定义 `__webpack_require__.f = {}` 与 `__webpack_require__.e = chunkId => Promise.all(Object.keys(f).reduce(...))`——即 `.e` 遍历所有已注册的 `.f` 处理器。
+- `JsonpChunkLoadingRuntimeModule.generate`（[JsonpChunkLoadingRuntimeModule.js:75](file:///e:/newGsb/questions/GSB-013/Thor/lib/web/JsonpChunkLoadingRuntimeModule.js#L75)）：把 `__webpack_require__.f.j = (chunkId, promises) => {...}` 注册进 `.f`（[:147](file:///e:/newGsb/questions/GSB-013/Thor/lib/web/JsonpChunkLoadingRuntimeModule.js#L147)），内部用 `loadScript` 插入 `<script>` 拉取 `lazy` chunk 文件，并挂 `webpackJsonpCallback` 在 chunk 到达时 resolve 那个 Promise。
+
+### 8.6 一图流：从一条 import 到浏览器装载
+
+| 源码 | build-time 产物 | 图/所有权 | 翻译进 runtime 的部分 | 域 |
+| --- | --- | --- | --- | --- |
+| `import {s} from "./shared"` | `HarmonyImportSideEffectDependency` + `...SpecifierDependency`（挂 entryA/entryB 的 `module.dependencies`） | ModuleGraph 一节点两入边；ChunkGraph 把 `shared` 连进两 chunk（`connectChunkAndModule`） | `__webpack_require__(id)` + `RuntimeGlobals.require` | build→output |
+| `import("./lazy")` | `AsyncDependenciesBlock` + 内含 `ImportDependency`（挂 entryA 的 `module.blocks`） | block → 新 ChunkGroup+Chunk（`iteratorBlock`/`addChunkInGroup`）；lazy 独立 async chunk | `__webpack_require__.e(chunkId).then(require.bind(...))` + `ensureChunk` | build→output |
+| （由 `ensureChunk` 派生） | requirement 集 `{ensureChunk, ensureChunkHandlers, ...}` | 无图节点，是 chunk 的 `runtimeRequirements` 元数据 | `EnsureChunkRuntimeModule` + `JsonpChunkLoadingRuntimeModule` 的 `generate()` 源码，打进 runtime chunk | output-runtime |
+
+**只存在于构建期**（编译结束即弃、不进产物）：`Dependency`、`AsyncDependenciesBlock`、`ModuleGraph`、`ChunkGraph`、`CodeGenerationResults`、`runtimeRequirements`（`Set<string>`）。
+**被翻译进 emitted runtime**：Dependency `.Template` 生成的 `__webpack_require__(...)` / `.e(...).then(...)` 表达式，以及 `RuntimeModule.generate()` 产出的 `.e` / `.f.j` 装载器代码。
+**跨编译存活（watch/cache 域）**：可序列化的 `Dependency`/`Block`（进持久化缓存以复用 build 结果），以及 §5 描述的 `Compiler`/`Cache`。
+
+---
+
+## 9. 待核实 / 未证实清单（后续深入方向）
+
+以下为**未直接读源确认**的点，标为 **未证实**，避免误导：
+
+- **未证实**：`SplitChunksPlugin` 在 `optimizeChunks` 阶段抽取共享模块（把 §8.3 中被复制的 `shared` 提成独立 chunk）的具体判据（`minChunks`/`minSize`/`cacheGroups`）尚未逐行读。
+- **未证实**：`runtimeChunk` 选项如何决定 runtime code 落在独立 runtime chunk 还是并入 entry chunk（§8.5 里 `addRuntimeModule` 的目标 chunk 选择）。
 - **未证实**：文件系统缓存（`cache.type === "filesystem"`）在 `WebpackOptionsApply` 中所装插件（`IdleFileCachePlugin` / `PackFileCacheStrategy` 等）的序列化与失效判定流程。
 - **未证实**：`MultiCompiler`（[lib/MultiCompiler.js](file:///e:/newGsb/questions/GSB-013/Thor/lib/MultiCompiler.js)）如何按 `setDependencies` 调度子 compiler 的先后与并行。
 - **未证实**：`module.build` / `module.codeGeneration` 在 `NormalModule` 中的 loader 执行与 parser（`JavascriptParser`）AST 遍历细节。
