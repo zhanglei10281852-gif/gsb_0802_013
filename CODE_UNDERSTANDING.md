@@ -549,49 +549,194 @@ JavaScript 渲染由 [JavascriptModulesPlugin](file:///e:/newGsb/questions/GSB-0
 
 所以最终 bundle runtime 是 `RuntimeModule`、普通模块生成结果、dependency templates、bootstrap/render 代码共同组成的 `Source`，再由 `Compilation.createChunkAssets()` 放入 `compilation.assets`，最后由 `Compiler.emitAssets()` 写出。
 
-## 6. watch/cache 域的边界
+## 6. watch/cache 域的失效与复用边界
 
-### 5.1 watch 复编译调度
+前几节的 `Compiler`、`Compilation`、parser、`ModuleGraph`、`ChunkGraph` 和 emitted runtime 都属于单次构建中的对象。watch/cache 域要解决的是：这些对象在下一轮构建里哪些能跨轮保留，哪些必须重新解析、重新建图、重新生成或重新写出。
 
-`Compiler.watch()` 设置 `watchMode = true` 并创建 [Watching](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compiler.js#L459-L468)。
+### 6.1 invalidation 从文件事件到新 compile
 
-`Watching` 构造函数在下一个 tick 自动 invalidate，见 [Watching.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/Watching.js#L33-L77)。每次 `_go()`：
+watch 模式下，[Watching](file:///e:/newGsb/questions/GSB-013/Tony/lib/Watching.js) 并不直接持有原生文件句柄；它通过 `compiler.watchFileSystem.watch()` 委托给 [NodeWatchFileSystem](file:///e:/newGsb/questions/GSB-013/Tony/lib/node/NodeWatchFileSystem.js#L30-L189)。每次 `Watching.watch()` 都：
 
-- pause 旧 watcher；
-- 设置 `compiler.fsStartTime`、`fileTimestamps`、`contextTimestamps`、`modifiedFiles`、`removedFiles`；
-- 若 cache idle 则先 `endIdle()`；
-- 首轮按需 `readRecords()`；
-- 异步 `watchRun`；
-- 调 `compiler.compile(onCompiled)`；
-- 编译成功后 emit assets/records；若期间已 invalid，则丢弃当前结果并重新开始；见 [Watching.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/Watching.js#L109-L239)。
+1. 把上一轮 watcher 放到 `pausedWatcher`，新创建一个 Watchpack；见 [Watching.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/Watching.js#L354-L394)。
+2. Watchpack aggregated 后，NodeWatchFileSystem 先 `pause()` 新 watcher，purge 掉 changed/removed paths 在 enhanced-resolve/cached input file system 中的缓存，再收集 `fileTimeInfoEntries`、`contextTimeInfoEntries`、`changes`、`removals` 回调；见 [NodeWatchFileSystem.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/node/NodeWatchFileSystem.js#L78-L109)。
+3. `Watching` 收到回调后进入 `_invalidate()`。
 
-`_done()` 在成功后：
+[Watching._invalidate](file:///e:/newGsb/questions/GSB-013/Tony/lib/Watching.js#L420-L442) 的核心规则是：
 
-- 创建 `Stats` 并执行 `done`；
-- `storeBuildDependencies()`；
-- `cache.beginIdle()` 并设置 `compiler.idle = true`；
-- 下一个 tick 用 compilation 的 `fileDependencies`、`contextDependencies`、`missingDependencies` 重新 watch；见 [Watching.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/Watching.js#L311-L345)。
+- 如果 `suspend()` 或插件设置的 blocker 生效，只缓存变化，不启动编译；`resume()` 时再 `_invalidate()`。
+- 如果当前 `running` 为 true，不立即重入 `compile()`，而是用 [_mergeWithCollected](file:///e:/newGsb/questions/GSB-013/Tony/lib/Watching.js#L83-L100) 合并 changed/removed，并设置 `this.invalid = true`。
+- 如果当前没有编译运行，则直接 `_go()`。
 
-文件变化由 `watchFileSystem.watch()` 回调进入 `_invalidate()`。若当前编译正在运行，只合并 changed/removed 集合并设置 `invalid = true`；当前轮 `_done()` 发现 invalid 后会重新 `_go()`，见 [Watching.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/Watching.js#L420-L442)。这解释了 watch 模式下为什么可能出现“编译结果不汇报、直接再编译”的情况。
+[Watching._go](file:///e:/newGsb/questions/GSB-013/Tony/lib/Watching.js#L109-L239) 启动新一轮时：
 
-### 5.2 `Cache` facade 与 memory cache
+- 若有旧 watcher，调它的 `pause()`，使其暂停上报；
+- 设置 `compiler.fsStartTime = Date.now()`；
+- 设置 `compiler.fileTimestamps`、`compiler.contextTimestamps`、`compiler.modifiedFiles`、`compiler.removedFiles`；
+- 如果 compiler 处于 idle，先 `cache.endIdle()`；
+- 首次需要 records 时 `readRecords()`；
+- 异步触发 `compiler.hooks.watchRun`；
+- 调用 `compiler.compile(onCompiled)`。
 
-`Compiler.cache` 是 [Cache](file:///e:/newGsb/questions/GSB-013/Tony/lib/Cache.js#L53-L160)，暴露：
+这解释了第一个排查重点：**文件改了却看起来复用旧结果时，先确认该文件是否进入了 `compiler.modifiedFiles`/时间戳，以及它是否是当前模块的 `fileDependencies`、`contextDependencies`、`missingDependencies` 或 build dependencies。** 没有登记为依赖的文件变化不会让对应模块 snapshot 失效。
 
-- `get`：`AsyncSeriesBailHook`；
-- `store`：`AsyncParallelHook`；
-- `storeBuildDependencies`：`AsyncParallelHook`；
-- `beginIdle`：`SyncHook`；
-- `endIdle`：`AsyncParallelHook`；
-- `shutdown`：`AsyncParallelHook`。
+编译运行中再次 invalid 时，[Watching._done](file:///e:/newGsb/questions/GSB-013/Tony/lib/Watching.js#L281-L345) 会在 store build dependencies 前检查 `this.invalid`；若已失效，当前 compilation 的结果不会走用户 handler/done 汇报，而是直接重新 `_go()`。这会形成“正在 emit 或 done 前又改文件，当前轮结果被丢弃”的行为。
 
-development 默认 cache 是 memory，production 默认 false；见 [defaults.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/config/defaults.js#L220-L231)。memory cache 由 [MemoryCachePlugin](file:///e:/newGsb/questions/GSB-013/Tony/lib/cache/MemoryCachePlugin.js#L22-L56) tap 到这些 hook：
+### 6.2 依赖集合和 snapshot：watch 保存的事实
 
-- `get` 阶段按 etag 命中内存 Map；
-- 底层返回 `undefined` 时负缓存为 `null`；
-- `shutdown` 时清空 Map。
+`Compilation` 在构造时创建四类集合，见 [Compilation.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compilation.js#L1183-L1189)：
 
-filesystem cache 也通过同一 `Cache` hook 层接入，但 idle pack 策略、序列化格式和 restore/store 细节本轮未逐行追完，标为“未证实”。
+- `fileDependencies`：已读取文件；
+- `contextDependencies`：需要监听目录内容变化的目录；
+- `missingDependencies`：构建时缺失、但未来出现后可能影响解析的路径；
+- `buildDependencies`：构建配置、loader、插件等影响构建过程的文件。
+
+普通模块构建时，[NormalModule.build](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L989-L1083) 会新建 `buildInfo.fileDependencies/contextDependencies/missingDependencies`，把 loader-runner 返回的 `result.fileDependencies`、`result.contextDependencies`、`result.missingDependencies` 加进去；如果有 loaders，还会把每个 `loader.loader` 加入 `buildDependencies`。
+
+构建和 parse 完成后，[handleBuildDone](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L1243-L1332) 调 `compilation.fileSystemInfo.createSnapshot()`，把这些 file/context/missing dependencies 转成 [Snapshot](file:///e:/newGsb/questions/GSB-013/Tony/lib/FileSystemInfo.js#L271-L306)，并清空原始集合，只保留 `buildInfo.snapshot`。因此模块跨编译复用时，下一轮不是重新扫描整个模块，而是把 snapshot 中的事实交给 FileSystemInfo 校验。
+
+[FileSystemInfo.createSnapshot](file:///e:/newGsb/questions/GSB-013/Tony/lib/FileSystemInfo.js#L2169-L2643) 会保存以下事实中的一种或多种：
+
+- file timestamp、file hash，或 timestamp + hash；
+- context resolved timestamp、context hash，或二者组合；
+- missing path 的 existence；
+- managed paths/immutable paths/package manager 信息；
+- child snapshots。
+
+默认模块 snapshot 选项来自 `compilation.options.snapshot.module`；hash/timestamp 模式由 options 决定。本文不把默认具体模式写死，因为它可能受配置和版本影响，当前版本以 [createSnapshot 的 mode](file:///e:/newGsb/questions/GSB-013/Tony/lib/FileSystemInfo.js#L2201-L2202) 和 snapshot options 为准。
+
+下一轮 `_buildModule()` 调 [NormalModule.needBuild](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L1540-L1592)，判定顺序为：
+
+1. `_forceBuild` 为 true：重建；
+2. 模块上次有 error：重建；
+3. `buildInfo.cacheable` 为 false：重建；
+4. 没有 snapshot：重建；
+5. `valueDependencies` 与 `valueCacheVersions` 不匹配：重建；
+6. [FileSystemInfo.checkSnapshotValid](file:///e:/newGsb/questions/GSB-013/Tony/lib/FileSystemInfo.js#L2803-L3249) 校验 snapshot；
+7. 最后还允许 `NormalModule.getCompilationHooks().needBuild` 异步强制重建。
+
+Snapshot 校验的关键比较在 [FileSystemInfo.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/FileSystemInfo.js#L2803-L2903)：
+
+- `checkExistence()` 比较 missing/path 是否存在；
+- `checkFile()` 比较文件 existence、safeTime/startTime 以及 timestamp；tsh/hash 模式下 timestamp 不可靠时可 fallback 到 hash；
+- `checkContext()` 比较目录 existence、safeTime/startTime 以及 `timestampHash`；
+- hash snapshot 直接比较 hash。
+
+safeTime/startTime 是避免 timestamp race 的关键：当前条目的 `safeTime` 晚于 snapshot startTime 时，FileSystemInfo 认为它可能在读取后变化，从而判定 invalid；见 [checkFile](file:///e:/newGsb/questions/GSB-013/Tony/lib/FileSystemInfo.js#L2824-L2858) 和 [checkContext](file:///e:/newGsb/questions/GSB-013/Tony/lib/FileSystemInfo.js#L2866-L2903)。
+
+### 6.3 从模块到 compilation：依赖如何进入下一轮 watch
+
+`Compilation.seal()` 接近完成时调用 [summarizeDependencies](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compilation.js#L4203-L4219)：
+
+- 先合并 child compilations 的四类依赖；
+- 再对每个 module 调 [NormalModule.addCacheDependencies](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L1621-L1646)。
+
+如果模块已有 snapshot，就从 snapshot 中展开 file/context/missing iterables；否则从 `buildInfo` 中取未转换的集合。buildDependencies 总是从 `buildInfo.buildDependencies` 加入 compilation。
+
+成功编译后，`Watching` 在 `_done()` 中：
+
+- 调 `compiler.cache.storeBuildDependencies(compilation.buildDependencies)`；
+- `cache.beginIdle()`；
+- 下一个 tick 用 `compilation.fileDependencies`、`contextDependencies`、`missingDependencies` 调 `watch()`，见 [Watching.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/Watching.js#L311-L345)。
+
+因此：
+
+- **fileDependencies** 决定已读文件变化是否触发模块重建；
+- **contextDependencies** 决定目录中新增/删除/重命名文件是否触发；
+- **missingDependencies** 决定之前不存在的文件/目录后来出现时是否触发；
+- **buildDependencies** 不用于监听普通模块文件变化，而用于决定整个持久化 cache 是否可恢复。
+
+“什么都没改却整轮重做”的常见原因之一，是目录 context 或 missing path 的 timestamp/hash 被外部工具刷新、snapshot safeTime 判定保守、或者 buildDependencies 被改变；这时即使源码内容没变，snapshot/value dependency 也可能判定需要 rebuild。
+
+### 6.4 `CacheFacade` identifier/etag：编译期对象复用的 key
+
+每次 `Compiler.compile()` 新建 [Compilation](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compilation.js#L993-L1209)，但它通过 [Compiler.getCache](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compiler.js#L327-L337) 获得带前缀的 [CacheFacade](file:///e:/newGsb/questions/GSB-013/Tony/lib/CacheFacade.js#L196-L300)。CacheFacade 把：
+
+- cache name，例如 `Compilation/modules`；
+- item identifier，例如 module identifier；
+- etag，例如 null、module hash 或 content hash；
+
+组合成底层 [Cache](file:///e:/newGsb/questions/GSB-013/Tony/lib/Cache.js#L53-L160) hook 的字符串 key。[ItemCacheFacade](file:///e:/newGsb/questions/GSB-013/Tony/lib/CacheFacade.js#L98-L160) 的 `get()`/`store()` 最终就是 `cache.get(name, etag)` 和 `cache.store(name, etag, data)`。
+
+etag 可以是字符串或支持 `updateHash()` 的对象；[getLazyHashedEtag](file:///e:/newGsb/questions/GSB-013/Tony/lib/cache/getLazyHashedEtag.js#L19-L40) 会惰性调用 `obj.updateHash(hash)` 并做 base64 digest。
+
+Compilation 中有三层最直接相关的 cache：
+
+1. **Module cache**：`_modulesCache = getCache("Compilation/modules")`，见 [Compilation.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compilation.js#L1203-L1205)。`_addModule()` 用 `module.identifier()` 和 etag `null` 读取；成功 build 后用相同 identifier 存入，见 [Compilation.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compilation.js#L1419-L1455) 和 [Compilation.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compilation.js#L1529-L1539)。模块是否可用不是靠这里的 etag，而是靠前面的 `needBuild()`。
+2. **Code generation cache**：`_codeGenerationCache = getCache("Compilation/codeGeneration")`，见 [Compilation.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compilation.js#L1203-L1205)。item key 是 `module.identifier()|runtime`，etag 是 `moduleHash|dependencyTemplates.getHash()`，见 [Compilation.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compilation.js#L3622-L3643)。
+3. **Asset/render cache**：`_assetsCache = getCache("Compilation/assets")`，见 [Compilation.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compilation.js#L1203-L1205)。`createChunkAssets()` 对 render manifest 的每个 entry，用 `fileManifest.identifier` 作为 key、`fileManifest.hash` 作为 etag 读取缓存；cache miss 才 render 并 store，见 [Compilation.js](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compilation.js#L4945-L5052)。
+
+所以复用边界是：
+
+- 模块没有 rebuild，通常可以复用 module object 和其上的 parse/AST/dependency 结果；
+- 模块 rebuild 了，但 module hash 或 dependency template hash 没变，理论上 code generation result 可复用；实际是否复用仍以 etag 命中为准；
+- module/chunk/runtime/template/content hash 没变，asset `Source` 可复用；
+- 即使 `Source` 复用，`Compiler.emitAssets()` 仍会根据磁盘状态、`compareBeforeEmit`、immutable 信息决定是否写盘；见第一版资源写出链路和 [Compiler.emitAssets](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compiler.js#L676-L1021)。
+
+### 6.5 filesystem pack cache：保存和验证的事实
+
+filesystem cache 由 `cache.type: "filesystem"` 的策略接入。核心类是 [PackFileCacheStrategy](file:///e:/newGsb/questions/GSB-013/Tony/lib/cache/PackFileCacheStrategy.js#L1064-L1547)，它把大量 CacheFacade item 存储到 pack content 中，并用一个 [PackContainer](file:///e:/newGsb/questions/GSB-013/Tony/lib/cache/PackFileCacheStrategy.js#L37-L86) 保存元事实：
+
+- `version`：cache version；
+- `buildSnapshot`：build dependencies 的 snapshot；
+- `buildDependencies`：未解析的构建依赖集合；
+- `resolveResults`：build dependencies 解析结果；
+- `resolveBuildDependenciesSnapshot`：解析 build dependencies 时自身依赖的 snapshot；
+- `data`：实际 pack items。
+
+恢复 pack 时，[_openPack](file:///e:/newGsb/questions/GSB-013/Tony/lib/cache/PackFileCacheStrategy.js#L1151-L1309) 依次验证：
+
+1. index pack 文件能反序列化为 `PackContainer`；
+2. `packContainer.version === version`；
+3. `buildSnapshot` 仍有效；
+4. `resolveBuildDependenciesSnapshot` 仍有效；如果失效，则用 `checkResolveResultsValid()` 再判断一次；
+5. 都有效才恢复 pack metadata 和 items；否则返回空 Pack。
+
+item 读取走 [restore](file:///e:/newGsb/questions/GSB-013/Tony/lib/cache/PackFileCacheStrategy.js#L1325-L1343)，Pack 内还会比较 item 的 etag，见 [Pack.get](file:///e:/newGsb/questions/GSB-013/Tony/lib/cache/PackFileCacheStrategy.js#L161-L177)。因此即使 pack 可打开，某个 module/codegen/asset item 的 etag 不匹配也只会返回 miss。
+
+每轮结束后，`Watching._done()` 或非 watch 的 `Compiler.run()` 调 `cache.storeBuildDependencies(compilation.buildDependencies)`。[IdleFileCachePlugin](file:///e:/newGsb/questions/GSB-013/Tony/lib/cache/IdleFileCachePlugin.js#L94-L103) 把它加入 pending idle task，最终由 [PackFileCacheStrategy.storeBuildDependencies](file:///e:/newGsb/questions/GSB-013/Tony/lib/cache/PackFileCacheStrategy.js#L1345-L1351) 合并到 `newBuildDependencies`。
+
+真正写 pack 在 [afterAllStored](file:///e:/newGsb/questions/GSB-013/Tony/lib/cache/PackFileCacheStrategy.js#L1353-L1534)：
+
+- 若有新的 build dependencies 或还没有 buildSnapshot，先 `resolveBuildDependencies()`；
+- 为解析过程的依赖创建 `resolveBuildDependenciesSnapshot`；
+- 为解析出的 files/directories/missing 创建 `buildSnapshot`；
+- 序列化新的 `PackContainer` 到 `cacheLocation/index.pack...`；
+- 更新内部 buildDependencies 集合。
+
+[IdleFileCachePlugin](file:///e:/newGsb/questions/GSB-013/Tony/lib/cache/IdleFileCachePlugin.js#L178-L228) 负责 idle 调度：beginIdle 后等待 idle timeout，再分批执行 pending tasks，之后 `afterAllStored()`；新一轮编译开始时 `endIdle` 会取消 timer。因此“文件改了但磁盘 cache 仍旧结果”的排查还要区分：是 memory item 命中、disk pack 恢复成功，还是 buildDependencies snapshot 没有覆盖真正的配置/loader 变化。
+
+### 6.6 失效边界与判定表
+
+| 变化类型 | watch/snapshot 如何发现 | 模块解析/构建图 | Code generation | Asset/写出 | 主要依据 |
+|---|---|---|---|---|---|
+| 普通源码文件内容变化，且文件已在 `fileDependencies` | FileSystemInfo snapshot 比较 timestamp/hash/existence；`needBuild()` 返回 true | 受影响模块重新 parse，dependency 和 `ModuleGraph` connection 重建；后续模块按图传播 | module hash 改变，codegen cache etag 失效 | render manifest content hash 变化，asset cache miss 后重新 render；通常需要写盘 | [NormalModule.needBuild](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L1540-L1592), [FileSystemInfo.checkFile](file:///e:/newGsb/questions/GSB-013/Tony/lib/FileSystemInfo.js#L2824-L2858) |
+| loader 额外登记的普通文件依赖变化 | loader-runner 结果进入 module 的 `fileDependencies`，最终转成 snapshot；校验失败则 rebuild | 重新跑 loader/parse，依赖结果可能变化 | module/build hash 通常变化，codegen etag 失效 | 受影响 chunk 的 content hash 变化则重新生成/写出 | [NormalModule.build](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L1063-L1083), [handleBuildDone](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L1314-L1332) |
+| loader 或 loader 配置/构建依赖变化 | 属于 `buildDependencies`；filesystem pack 恢复前验证 `buildSnapshot` 和 resolve results | 若 buildDependencies 失效，pack 不恢复，模块/解析重新计算；即使模块文件内容没变，也不能安全复用旧构建过程 | pack 中 codegen items 不会作为有效 cache 恢复 | pack 中 asset items 也不会作为有效 cache 恢复 | [NormalModule.build](file:///e:/newGsb/questions/GSB-013/Tony/lib/NormalModule.js#L1075-L1081), [PackFileCacheStrategy._openPack](file:///e:/newGsb/questions/GSB-013/Tony/lib/cache/PackFileCacheStrategy.js#L1203-L1286) |
+| 缺失依赖出现 | 路径必须已在 `missingDependencies` 并被 watch；snapshot 比较 existence，从 missing 变 existing 会 invalid | 相关模块需要重新解析；常见于可选文件、扩展路径、生成文件出现 | 若解析结果影响模块依赖或 hash，则 codegen 失效 | 受影响 asset 重新生成/写出 | [FileSystemInfo.createSnapshot](file:///e:/newGsb/questions/GSB-013/Tony/lib/FileSystemInfo.js#L2555-L2583), [checkExistence](file:///e:/newGsb/questions/GSB-013/Tony/lib/FileSystemInfo.js#L2803-L2816) |
+| context directory 中新增/删除文件，但入口文件本身没变 | 路径必须在 `contextDependencies`；context snapshot 比较 `timestampHash`/hash，变化则 rebuild | 重新解析目录，可能发现新模块或移除旧模块 | 解析结果影响 graph/hash 时 codegen 失效 | chunk graph/content hash 变化则重新生成 asset | [FileSystemInfo.checkContext](file:///e:/newGsb/questions/GSB-013/Tony/lib/FileSystemInfo.js#L2866-L2903), [Watching.watch](file:///e:/newGsb/questions/GSB-013/Tony/lib/Watching.js#L354-L394) |
+| 编译过程中再次 invalid | `Watching.running` 时只合并 changed/removed 并设 `invalid=true` | 当前 compile 继续完成，但 `_done()` 发现 invalid 后立即重新 `_go()` | 当前 codegen/asset 可能已计算，但结果不汇报；下一轮重新 compile/判定 cache | 当前 emit/done 可能被跳过或结果不汇报；下一轮重新 emit | [Watching._invalidate](file:///e:/newGsb/questions/GSB-013/Tony/lib/Watching.js#L420-L442), [Watching._done](file:///e:/newGsb/questions/GSB-013/Tony/lib/Watching.js#L281-L300) |
+| 只有未影响 module hash/dep template hash 的内部变化 | 可能 rebuild，但如果 hash 结果一致 | 依赖或内部数据可能更新，但 codegen etag 仍匹配 | code generation result 可从 cache 复用 | 若 manifest identifier/content hash 不变，asset `Source` 可复用；写盘仍由 emit 比较逻辑决定 | [code generation cache](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compilation.js#L3636-L3644), [asset cache](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compilation.js#L4951-L5052) |
+| 输出 asset 内容没变但磁盘文件被删或 mtime 变化 | 这不是 module snapshot 问题，而是 emit 阶段状态问题 | 不需要重新建图 | 不需要重新 codegen，可复用内存 asset source | `emitAssets()` 根据 stat/readFile/immutable/compareBeforeEmit 判断是否重新 writeFile | [Compiler.emitAssets](file:///e:/newGsb/questions/GSB-013/Tony/lib/Compiler.js#L893-L982) |
+
+### 6.7 两类问题的排查顺序
+
+**“文件改了却复用旧结果”优先检查：**
+
+1. 文件事件是否进入 Watchpack，并在 `NodeWatchFileSystem` aggregated 回调中 purge 缓存；
+2. `compiler.modifiedFiles`/`removedFiles` 是否包含该路径；
+3. 该路径是否被模块加入 `fileDependencies`/`contextDependencies`/`missingDependencies`；若是 loader 生成的依赖，检查 loader 是否正确调用 `this.addDependency/addContextDependency/addMissingDependency`；
+4. `NormalModule.needBuild()` 是否因为 cacheable/snapshot/valueDependencies 返回 false；
+5. filesystem cache 的 buildDependencies/version 是否让旧 pack 被恢复，但 item etag 实际应变化；
+6. 动态 import 对应异步块是否复用旧 chunk asset；需要看 render manifest hash 和 codegen etag，而不是只看文件时间。
+
+**“什么都没改却整轮重做”优先检查：**
+
+1. 是否有 context dependency 的目录 timestampHash 被编辑器、临时文件、代码生成器刷新；
+2. 是否有 missing dependency 在不存在/存在之间抖动，导致解析路径变化；
+3. buildDependencies 是否包含不稳定路径、软链、loader 生成文件或配置文件；
+4. `fsStartTime`/safeTime 是否因文件系统时间精度而保守判定 snapshot invalid；
+5. 插件是否在 `watchRun`、`normalModuleFactory`、`needBuild` 等 hook 中强制 invalidate 或修改 value cache versions；
+6. 是否是编译中连续保存触发 `Watching.invalid`，导致上一轮结果被丢弃。这不是复用错误，而是调度层主动重编译。
 
 ## 7. hook 短路、异步边界和多轮编译要点
 
@@ -611,7 +756,6 @@ filesystem cache 也通过同一 `Cache` hook 层接入，但 idle pack 策略�
 
 以下内容本轮没有逐行确认，后续接手时不要把本文当作这些细节的最终结论：
 
-- filesystem cache 的 pack file 格式、idle 写入时机、restore 顺序和 invalidation 细节；
 - `NormalModule.build()` 内部 loader-runner、parser、generator 协作的每一步状态变化；
 - `JavascriptModulesPlugin.renderMain()`/`renderChunk()` 中 bootstrap、init fragments、startup 拼接的完整细节；
 - `MultiCompiler` 的并行/依赖调度细节；
