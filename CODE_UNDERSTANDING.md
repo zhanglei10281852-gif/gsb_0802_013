@@ -361,7 +361,7 @@ src/lazy.js   export function lazy() { return "LAZY"; }
 
 浏览器执行路径（本场景，web target）：加载 a.js → runtime modules 初始化 `installedChunks`/`__webpack_require__.f.j` → startup 执行 `./a.js` → 静态 `shared` 经 `__webpack_require__` 命中本 bundle 内副本 → 执行到 `import()`：`__webpack_require__.e("lazy-chunk")` → `f.j` 查 `installedChunks`，未装载则建 Promise 并插入 `<script src=__webpack_require__.p + __webpack_require__.u("lazy-chunk")>` → `lazy-chunk.js` 执行 push → `webpackJsonpCallback` 把工厂并入 `__webpack_modules__` 并 resolve → `.then(__webpack_require__.bind(__webpack_require__, "./lazy.js"))` 取到命名空间执行 `m.lazy()`。
 
-### 7.8 本章运行期核对（临时脚本，仓库外临时目录；工具见第 9 节）
+### 7.8 本章运行期核对（临时脚本，仓库外临时目录；工具见第 10 节）
 
 - 默认配置（`splitChunks.chunks: "async"`）：产物 `a.js`、`b.js`、`lazy-chunk.js` 三个文件。a.js 同时含 `shared` 模块工厂、`__webpack_require__.e(/*! import() | lazy-chunk */ "lazy-chunk").then(__webpack_require__.bind(__webpack_require__, /*! ./lazy */ "./lazy.js"))` 调用点、`__webpack_require__.f.j = ` 与 `installedChunks`；b.js 含 `shared` 模块工厂但无任何 chunk 装载运行时；`lazy-chunk.js` 为 `(...webpackChunk...).push([[...], ...])` 包裹格式。→ 证实 7.3/7.4/7.5/7.6 的默认行为。
 - `splitChunks: { chunks: "all", minSize: 0 }`：多出 `shared_js.js`（含 `shared` 工厂、push 格式），a.js/b.js 不再含 `shared` 工厂；b.js 新出现 `installedChunks`（抽包后入口需先确保共享 chunk 装载）。→ 证实 7.6 的条件讨论。
@@ -370,23 +370,99 @@ src/lazy.js   export function lazy() { return "LAZY"; }
 
 ---
 
-## 8. 未证实 / 待核对清单
+## 8. watch/cache：invalidation 汇总、失效边界与复用判定
+
+本章面向两类 watch 问题——"文件改了却复用了旧结果"与"什么都没改却整轮重做"。执行域与对象所有权沿用第 1、3.6、5 节；异步块到 emitted runtime 的边界沿用第 7 章。
+
+### 8.1 从 invalid 事件到新一轮 compile（watch 域）
+
+- **事件采集**：`NodeWatchFileSystem.watch`（`lib/node/NodeWatchFileSystem.js:30-189`）包装 Watchpack。Watchpack 的 `"aggregated"` 事件回调里（`:78-107`）：先 `watcher.pause()`，再对 changed/removed 逐项 `inputFileSystem.purge(item)`（清 60s 的 `CachedInputFileSystem` 缓存），然后 `collectTimeInfoEntries` 收集 file/context 时间戳，最后回调给 `Watching._invalidate`。未延迟的 `"change"` 事件走 `callbackUndelayed` → `Watching` 的 invalid 回调 → `compiler.hooks.invalid.call(fileName, changeTime)`（每轮只报一次，`_invalidReported` 闸口，`lib/Watching.js:386-392`）。`aggregateTimeout` 默认 20ms（`lib/Watching.js:59-61`）。
+- **汇总 changed/removed**：`Watching._mergeWithCollected`（`lib/Watching.js:83-100`）把多次事件的 changed/removed 累积进 `_collectedChangedFiles`/`_collectedRemovedFiles`（同一文件 changed 优先于 removed）。
+- **暂停与恢复 watcher**：`Watching._go`（`:109-238`）开头把当前 watcher `pause()` 并保存为 `pausedWatcher`（之后经 `pausedWatcher.getInfo()` 取变更与时间戳，`getInfo` 内部同样 purge + collect，`NodeWatchFileSystem.js:164-187`）；本轮 `_done` 末尾（`process.nextTick`）再用**本轮 Compilation 汇总的三类依赖**重新 `watch(fileDependencies, contextDependencies, missingDependencies)`（`lib/Watching.js:328-339`）。`suspend()`/`resume()`（`:443-452`）只切换收集/构建行为。
+- **进入新 compile**：`_go` 把 `fileTimestamps`/`contextTimestamps`/`modifiedFiles`/`removedFiles`/`fsStartTime` 写到 `compiler` 上（`modifiedFiles`/`removedFiles` 主要供插件与 `createChildCompiler` 继承，**核心重建判定并不消费它们**，见 8.2）→ 仅首轮 `readRecords` → `compiler.hooks.watchRun.callAsync` → `compiler.compile(onCompiled)`（与 run 域共享第 3 章全部流程，但**不走 `beforeRun`/`run`**）。
+- **构建过程中再次 invalid**：`_invalidate` 在 `running` 时只合并变更并置 `this.invalid = true`（`:430-432`）；之后有两个检查点——`onCompiled` 进入时（`:190`）和 `emitAssets` 完成之后（`:202`）——任一命中都直接 `_done(null, compilation)`，而 `_done` 头部（`:280-300`）见 `invalid` 就 `cache.storeBuildDependencies` 后**立即再 `_go()` 重建**。注意第二个检查点在 emit 之后：产物可能已落盘，但 stats/done 以新一轮为准。
+- **手动失效**：`watching.invalidate([callback])`（`:400-410`）触发 `hooks.invalid.call(null, Date.now())` 并立即 `_invalidate()`。
+
+### 8.2 每轮 compile 内的三个失效边界（构建期 compiler 域）
+
+每轮 watch 重建仍是"新 `Compilation`、复用 `Compiler`/`Cache`"。失效判定发生在三层，由不同机制承担：
+
+1. **编译图边界（模块是否重建）**：
+   - 恢复：`_addModule`（`lib/Compilation.js:1419-1454`）先查 `_modulesCache`（`compiler.getCache("Compilation/modules")` 的 `CacheFacade`，identifier = `module.identifier()`，etag = `null`）；命中则 `cacheModule.updateCacheModule(module)`，**连同上轮的 `buildInfo.snapshot` 一起复用**。`cache: false` 时此处永远落空——实测每轮全量重建（8.6）。
+   - 判定：`_buildModule` → `NormalModule.needBuild`（`lib/NormalModule.js:1540-1592`）：`_forceBuild`/带错误/不可缓存/无 snapshot/`valueDependencies` 变化 → 必建；否则 `fileSystemInfo.checkSnapshotValid(buildInfo.snapshot)`（`lib/FileSystemInfo.js:2729`，结果缓存于本 Compilation 的 `_snapshotCache` WeakMap）。snapshot 是构建完成时由 `createSnapshot(startTime, fileDependencies, contextDependencies, missingDependencies, snapshotOptions)` 生成的（`lib/NormalModule.js:1315-1329`），记录三类依赖的 timestamp/hash/missingExistence/managed 信息；校验逐项比对存在性、时间戳（含 `safeTime > startTime` 的"构建开始后又被改"判定，`FileSystemInfo.js:2829-2841`）与 hash。
+   - 感知变化的通道：新 `Compilation` 构造时，若 `compiler.fileTimestamps` 非空（watchpack 收集的新鲜时间戳），先 `fileSystemInfo.addFileTimestamps(compiler.fileTimestamps, true)`（`lib/Compilation.js:1014-1016`）喂给 `FileSystemInfo` 的 `_fileTimestamps`；另一通道是 8.1 的 `inputFileSystem.purge` 后重新 stat。
+   - 快照严格度默认值（`lib/config/defaults.js:546-556`）：`snapshot.module`/`snapshot.resolve` 在 production 为 `{timestamp: true, hash: true}`、非 production 为 `{timestamp: true}`——**开发期 mtime 变化即重建该模块（哪怕内容相同），生产期要求内容 hash 也不同才算失效**；`snapshot.buildDependencies`/`resolveBuildDependencies` 恒为 `{timestamp: true, hash: true}`。
+2. **代码生成结果边界（代码是否重算）**：`_codeGenerationModule` 的 `_codeGenerationCache`（`lib/Compilation.js:3636-3642`）：identifier 含 `module.identifier()|runtime`，etag 含**模块 hash + dependencyTemplates hash**——模块内容 hash 没变（未重建，或重建后内容相同）即命中；`_assetsCache`（`:4951-4956`）以 renderManifest 的 identifier 与 chunk hash 为 key/etag，chunk hash 没变直接复用渲染出的 `Source`。
+3. **写出资产边界（写入产物的 runtime 域）**：`emitAssets` 的 `compareBeforeEmit` 与写入代数（`lib/Compiler.js:892-923/934-965`，第 4 节）：目标文件字节相同 → 跳过写入（保 mtime，避免触发下游 watcher）；`immutable` 资产直接跳过。实测：touch-only 轮次模块虽重建，产物零重写（8.6）。
+
+### 8.3 各"事实存储"存什么、何时验证
+
+| 机制 | 保存的事实 | 验证时机与方式 |
+| --- | --- | --- |
+| `Watching`（`_collectedChangedFiles` 等） | watchpack 上报的 changed/removed 文件集合 | 仅用于合并/作废轮次与发布到 `compiler.modifiedFiles`；**不做内容判定** |
+| 模块 `buildInfo.snapshot`（`FileSystemInfo`） | 该模块构建时 file/context/missing 三类依赖的时间戳/hash/missingExistence/managed 信息 + startTime | 每轮 `needBuild` → `checkSnapshotValid`（本 Compilation 内结果缓存） |
+| `compilation.fileDependencies`/`contextDependencies`/`missingDependencies`/`buildDependencies` | 全图依赖清单（`summarizeDependencies` 汇总，`lib/Compilation.js:4203`；loader 经 `this.addDependency` 等登记进模块，再并入 compilation） | 前三类决定 **watcher 下一轮监听的文件集**；`buildDependencies` 交给 cache |
+| `CacheFacade`/identifier+etag（`lib/CacheFacade.js:98-194`） | 单条缓存的键（identifier）与版本（etag，常为 `getLazyHashedEtag` 懒求值的 `updateHash` base64，`lib/cache/getLazyHashedEtag.js:19-41`；`mergeEtags` 组合多源） | `MemoryCachePlugin` 内存命中要求 **etag 引用相等**（`lib/cache/MemoryCachePlugin.js:38`）；filesystem 层按 `etag.toString()` 比对（`PackFileCacheStrategy.js:1321/1332`） |
+| `PackFileCacheStrategy`（`lib/cache/PackFileCacheStrategy.js`） | 单文件 pack：`PackContainer`{`version`、`buildSnapshot`（buildDependencies 的 ts+hash 快照）、`buildDependencies`、`resolveResults`、`resolveBuildDependenciesSnapshot`}（`:37-81`） | **启动 `_openPack` 时**（`:1151-1309`）：version 匹配 → `checkSnapshotValid(buildSnapshot)` + `checkSnapshotValid(resolveBuildDependenciesSnapshot)`（后者失败降级 `checkResolveResultsValid`）——**两者都有效才恢复整个 pack**，否则整包作废；此后单条 restore 只按 identifier+etag 查 |
+| `IdleFileCachePlugin`（`lib/cache/IdleFileCachePlugin.js`） | `pendingIdleTasks`（待落盘的 store 任务） | `beginIdle` 后按 `idleTimeout`（默认 60000）/`idleTimeoutForInitialStore`（5000）/`idleTimeoutAfterLargeChanges`（1000，`lib/config/defaults.js:461-463`）落盘；`shutdown` 时强制全部落盘并 `strategy.afterAllStored()`（`:105-131`） |
+| `afterAllStored` 的 buildDependencies 快照（`PackFileCacheStrategy.js:1352-1534`） | 每轮 `done` 后新增的 `compilation.buildDependencies`（`AddBuildDependenciesPlugin` 登记 `cache.buildDependencies`，默认含 webpack 自身 lib 目录，`lib/cache/AddBuildDependenciesPlugin.js:24-29`、`lib/config/defaults.js:469-474`） | 落盘前 `resolveBuildDependencies` + 两次 `createSnapshot` 并与旧快照 `mergeSnapshots` |
+
+`FileSystemInfo` 另有 managed/immutable 路径优化（`createSnapshot` 的 `checkManaged`，`lib/FileSystemInfo.js:2265-2306`；默认 `managedPaths` 指向 node_modules，`lib/config/defaults.js:490-545`）：managed 路径下的文件不做逐文件时间戳快照，而是按包级 managed 项记录（字段细节见第 9 章未证实清单第 10 条）——**直接改 node_modules 里的文件默认不会触发重建**，这是"改了却复用旧结果"最常见的解释之一。
+
+### 8.4 判定表：可安全复用 / 必须重建或重新解析 / 只需重新生成或写出
+
+| 场景 | 记录的依赖/快照事实 | 下一轮的行为 | 判定 |
+| --- | --- | --- | --- |
+| 普通源码变化（内容或 mtime 改变） | 文件在 `fileDependencies`；模块 snapshot 的 timestamp（+hash） | watcher 报 invalid → 该模块 snapshot 失效 → **仅该模块重建**（实测 `buildModule` 只含它）；其 hash 变 → 受影响 chunk 重新 codeGeneration/渲染；内容变化的资产重写，其余资产不重写 | **必须重建**（该模块）＋ **重新生成/写出**（受影响 chunk） |
+| loader 额外登记的依赖变化（`this.addDependency` 等） | 同上：loader 登记的文件进模块的三类依赖 → compilation 依赖集 → watch 集合 | 与普通源码变化一致，失效范围仍限于登记它的模块 | **必须重建**（登记模块） |
+| 缺失依赖出现（resolve 探测过但不存在的文件后被创建） | `missingDependencies` + snapshot 的 `missingExistence(false)` | watch 集合含 missing 项；出现即 invalid；`checkExistence` 不一致（`FileSystemInfo.js:2803-2816`）→ snapshot 失效 → 相关模块重建，resolve 结果可能改变（重新解析） | **必须重建或重新解析** |
+| 构建依赖/配置变化（webpack 本体、loader、babel 配置等已登记项） | `buildDependencies` + Pack 的 `buildSnapshot`（ts+hash）与 resolve 快照 | filesystem cache：**下次启动** `_openPack` 校验失败 → 整包作废（首轮全量重建）；memory cache 进程内没有对应热路径（通常随进程重启）（热路径未证实） | **整包失效**（filesystem） |
+| 构建过程中再次 invalid | 变更并入 collected 集合，`Watching.invalid = true` | 检查点（emit 前 `:190` / emit 后 `:202`）命中 → 本轮结果丢弃，`storeBuildDependencies` 后立即再 `_go`；emit 后命中时产物可能已落盘 | **本轮作废，重做整轮 compile**（模块级 snapshot 复用仍生效） |
+| 什么都没改（启动期伪 invalid：文件 mtime ≥ watcher startTime） | watchpack 初始即报告 change（实测，见 8.6） | 整轮 compile 编排照跑：模块全部从 `_modulesCache` 恢复、snapshot 全部有效 → **零 buildModule**；hash/资产全同 → **零重写** | **可安全复用**（全链路短路，只剩编排开销） |
+| `cache: false`（对照） | 无 `_modulesCache` 命中 | 每轮**全量重建所有模块**（实测，见 8.6） | — |
+
+### 8.5 两类问题的排查索引
+
+- **"文件改了却复用了旧结果"候选原因**：
+  1. 文件在 `managedPaths`/`immutablePaths`（默认 node_modules）下，被包级 managed 优化吞掉（8.3）；
+  2. 文件不在 `fileDependencies`（loader/plugin 读了文件但没登记依赖）→ watcher 根本不监听它；
+  3. 自定义 `inputFileSystem`/`watchFileSystem` 的缓存层未实现/未调 `purge`；
+  4. filesystem cache 的 `version` 或 buildDependencies 快照过期判断与实际预期不符（排查 `_openPack` 的日志，`infrastructureLogging`）；
+  5. 生产构建但只改了 mtime（`snapshot.module` 在 production 要求 hash 变化——这属于设计行为）。
+- **"什么都没改却整轮重做"候选原因与缓解**：
+  1. 启动期伪 invalid（8.6 实测）：watch 启动前一刻写入的文件 mtime ≥ watcher startTime → 触发一轮零重建的 compile；缓解是让写入与 watch 启动错开（属 watchpack startTime 语义，细节未证实）；
+  2. `cache: false`（或 cache 类型配置错误）→ 每轮全量重建（8.6 对照实测）；
+  3. touch 类操作（只动 mtime）：开发期 `snapshot.module` 只看 timestamp → 该模块会重建，但内容 hash 不变 → 资产零重写（8.6 实测）——"重建模块"不等于"重写产物"，两个边界要分开看；
+  4. `snapshot.module/resolve` 误配为 `{hash: true}` 之外的更弱组合、`managedPaths` 配错导致全量 stat、`aggregateTimeout` 过小导致频繁轮次。
+
+### 8.6 本章运行期核对（临时脚本，仓库外临时目录；工具见第 10 节）
+
+- **开发默认（memory cache）三轮实测**：首轮全量构建（`built = [a.js, shared.js, lazy.js]`）；真改 `shared.js` 内容 → 第二轮 `built = [shared.js]`、重写只有 `a.js`（`lazy-chunk.js` mtime 不变）；仅 `utimes` touch `shared.js`（内容不变）→ 第三轮 `built = [shared.js]`、**零重写**。→ 证实 8.2 三个边界与 8.4 判定表第 1 行、第 3 行（touch 场景）。
+- **启动期伪 invalid 实测**：源文件在 watch 启动前一刻写入时，watchpack 立即报告 change（`invalid` 事件的 changeTime 等于文件 mtime），产生一轮 `built = []`、零重写的完整 compile。→ 证实 8.4"什么都没改"行的成因。
+- **`cache: false` 对照实测**：每轮 `built = [a.js, lazy.js, shared.js]` 全量重建并重写全部产物。→ 证实 `_modulesCache`/memory cache 是细粒度复用的前提（8.2 第 1 条）。
+- 上述实测中 `invalid` hook 参数与 `compiler.modifiedFiles` 均与变更文件一致，证实 8.1 的事件路径。
+- 未做：filesystem cache 跨进程恢复/失效的运行期核对；managedPaths 包级字段的运行期核对（结论仍属静态阅读）。
+
+---
+
+## 9. 未证实 / 待核对清单
 
 以下内容本轮**未逐行核对或无法从当前版本确认**，后续按需要补读：
 
 1. `bin/webpack.js` 转发 `webpack-cli` 的完整逻辑（只读文件头 60 行）。
 2. `MultiCompiler._runGraph` / `validateDependencies` 的调度细节；`MultiWatching` 行为。
-3. `IdleFileCachePlugin` / `PackFileCacheStrategy` 的 store/restore 内部流程与序列化格式（`lib/serialization/*`）。
-4. `JavascriptModulesPlugin` 的 `renderManifest` tap 产出的具体 `render()` 实现（`renderChunk`/`renderMain` 未读）；`MainTemplate`/`ChunkTemplate`/`ModuleTemplate` 的实际角色（`Compilation` 构造时创建，`lib/Compilation.js:1039-1049`）。
+3. ~~`IdleFileCachePlugin` / `PackFileCacheStrategy` 的 store/restore 内部流程~~（第 8 章已覆盖主流程；仅剩 `lib/serialization/*` 的二进制格式细节未读）。
+4. `JavascriptModulesPlugin` 的 `renderManifest` tap 产出的具体 `render()` 实现（第 7 章已覆盖 `renderMain`/`renderChunk`/`renderRequire` 主体；`MainTemplate`/`ChunkTemplate`/`ModuleTemplate` 的实际角色仍未细读，`Compilation` 构造时创建，`lib/Compilation.js:1039-1049`）。
 5. `Stats`/`StatsFactory`/`StatsPrinter` 输出链（仅确认注册点与 `new Stats(compilation)` 调用点）。
 6. `lib/config/target.js` 的 browserslist 解析细节（只确认函数名与调用点）。
 7. `processRuntimeRequirements` 中 module 级收集段（`:3708-3800` 前段）的逐行逻辑。
 8. `lib/index.js` 的全部 lazy 导出清单（只读头部 120 行）。
-9. 除第 9 节已核对的运行期行为外，其余调用顺序结论来自静态阅读。
+9. 除第 10 节已核对的运行期行为外，其余调用顺序结论来自静态阅读。
+10. `FileSystemInfo` managed 项记录的具体字段（`getManagedItem`/`managedItemInfo`，判定为包级管理信息，未逐行确认字段构成）；`checkResolveResultsValid` 的判定细节；watchpack 自身的 startTime 过滤语义（按事件表现推断）。
 
 ---
 
-## 9. 核对记录
+## 10. 核对记录
 
 - [x] 源码逐行阅读：`lib/webpack.js`、`lib/Compiler.js`、`lib/Compilation.js`（主链路）、`lib/config/{normalization,defaults}.js`、`lib/WebpackOptionsApply.js`、`lib/EntryOptionPlugin.js`、`lib/EntryPlugin.js`、`lib/DynamicEntryPlugin.js`、`lib/node/NodeEnvironmentPlugin.js`、`lib/Watching.js`、`lib/Cache.js`、`lib/NormalModuleFactory.js`（主链路段）、`lib/buildChunkGraph.js`（结构）、`lib/ModuleGraph.js`/`lib/ChunkGraph.js`（结构与静态反查）、`lib/validateSchema.js`、`lib/MultiCompiler.js`（部分）、`lib/javascript/JavascriptModulesPlugin.js`（hook 挂点）。
 - [x] `yarn install --frozen-lockfile`（Yarn 1.22.22，lockfile 未变；安装后 `git status` 仍只有本文件一个改动）。
@@ -398,4 +474,6 @@ src/lazy.js   export function lazy() { return "LAZY"; }
   - 创建期 hooks（`environment`/`afterEnvironment`/`afterPlugins`/`afterResolvers`/`initialize`）在 `webpack()` 返回前已触发，返回后再 tap 捕获不到——与 2.3 节顺序一致。
 - [x] 第 7 章（场景追踪）源码阅读：`lib/dependencies/{ImportPlugin,ImportParserPlugin,ImportDependency,HarmonyModulesPlugin,HarmonyImportDependency,HarmonyImportSpecifierDependency,HarmonyImportDependencyParserPlugin}.js`、`lib/AsyncDependenciesBlock.js`、`lib/RuntimeTemplate.js`（`importStatement`/`moduleNamespacePromise`/`blockPromise`）、`lib/RuntimePlugin.js`、`lib/runtime/{EnsureChunkRuntimeModule,GetChunkFilenameRuntimeModule}.js`、`lib/web/{JsonpChunkLoadingPlugin,JsonpChunkLoadingRuntimeModule}.js`、`lib/javascript/{EnableChunkLoadingPlugin,ArrayPushCallbackChunkFormatPlugin,JavascriptModulesPlugin}.js`（render/renderMain/renderRequire）、`lib/buildChunkGraph.js`（`iteratorBlock`/队列处理段）、`lib/optimize/SplitChunksPlugin.js`（hook 挂点）、`lib/Chunk.js`（`hasRuntime`）。
 - [x] 第 7 章场景运行期冒烟：两入口 + 共享模块 + 带 `webpackChunkName` 的动态 `import()`，development 默认配置与 `splitChunks: { chunks: "all", minSize: 0 }` 各构建一次，结果见 7.8（全部通过，临时脚本已删除）。
-- 未做：watch 模式与 filesystem 缓存的运行期核对（覆盖第 5 节，仍属静态阅读结论）。
+- [x] 第 8 章（watch/cache）源码阅读：`lib/Watching.js`、`lib/node/NodeWatchFileSystem.js`、`lib/FileSystemInfo.js`（`createSnapshot`/`checkSnapshotValid`/managed 段）、`lib/NormalModule.js`（`needBuild`/snapshot 创建段）、`lib/CacheFacade.js`、`lib/cache/{MemoryCachePlugin,IdleFileCachePlugin,PackFileCacheStrategy,AddBuildDependenciesPlugin,getLazyHashedEtag}.js`、`lib/config/defaults.js`（snapshot/cache 默认段）。
+- [x] 第 8 章 watch 运行期冒烟（临时脚本已删）：开发默认 memory cache 下"真改内容 / 仅 touch"两轮（`built=[shared.js]`，重写分别为 `[a.js]` 与 `[]`）；启动期伪 invalid 产生零重建轮次；`cache: false` 对照为每轮全量重建。结果见 8.6。
+- 未做：filesystem cache 跨进程恢复/失效的运行期核对（8.3/8.4 相关结论中 Pack 策略部分仍属静态阅读）。
