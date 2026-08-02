@@ -741,7 +741,347 @@ __webpack_require__.f.j = function(chunkId, promises) {
 
 ---
 
-## 8. 待深入与未证实项
+## 9. watch/cache 域：失效传播与复用边界
+
+本节沿用第 0 节的三个执行域定义，追踪 watch 模式下一次文件变化如何从 watcher 传播到模块、编译图、code generation 和资产写出，以及各层缓存的 identifier/etag 如何决定"复用旧结果"还是"重做"。
+
+### 9.1 一次 invalidation 的完整传播链
+
+#### 9.1.1 watcher 检测与聚合
+
+watch 模式由 [NodeWatchFileSystem](file:///e:/newGsb/questions/GSB-013/Steve/lib/node/NodeWatchFileSystem.js) 包装 [watchpack](https://github.com/webpack/watchpack)。[Watching.watch](file:///e:/newGsb/questions/GSB-013/Steve/lib/Watching.js#L354-L395) 在上一轮编译结束后、`_done` 的 `process.nextTick` 中被调用，传入上一轮 compilation 收集到的 `fileDependencies`、`contextDependencies`、`missingDependencies`。
+
+`NodeWatchFileSystem.watch` 每次创建一个新的 `Watchpack(options)` 实例（[#L61](file:///e:/newGsb/questions/GSB-013/Steve/lib/node/NodeWatchFileSystem.js#L61)），注册两个回调：
+
+- `callbackUndelayed`（[#L63-L65](file:///e:/newGsb/questions/GSB-013/Steve/lib/node/NodeWatchFileSystem.js#L63-L65)）：监听 watchpack 的 `"change"` 事件，第一次变化时立即触发，对应 [Watching](file:///e:/newGsb/questions/GSB-013/Steve/lib/Watching.js#L387-L393) 中的：
+
+  ```js
+  (fileName, changeTime) => {
+      if (!this._invalidReported) {
+          this._invalidReported = true;
+          this.compiler.hooks.invalid.call(fileName, changeTime);
+      }
+      this._onInvalid();
+  }
+  ```
+
+  这就是 `compiler.hooks.invalid` 的触发点——它在第一次变化时触发一次，通知外部"即将重新编译"，但不携带具体变化集合。
+
+- `callback`（[#L78-L107](file:///e:/newGsb/questions/GSB-013/Steve/lib/node/NodeWatchFileSystem.js#L78-L107)）：监听 watchpack 的 `"aggregated"` 事件。watchpack 在 `aggregateTimeout`（Watching 默认 20ms，[Watching.js#L59-L61](file:///e:/newGsb/questions/GSB-013/Steve/lib/Watching.js#L59-L61)）内聚合所有变化后触发此事件。回调内：
+  1. `this.watcher.pause()` 暂停 watcher，避免在编译期间继续触发事件。
+  2. 对每个变化/删除项调用 `inputFileSystem.purge(item)` 清理 enhanced-resolve 的 `CachedInputFileSystem` 缓存（[#L89-L97](file:///e:/newGsb/questions/GSB-013/Steve/lib/node/NodeWatchFileSystem.js#L89-L97)）。
+  3. `watcher.collectTimeInfoEntries(fileTimeInfoEntries, contextTimeInfoEntries)` 收集所有被监视文件/目录的最新时间戳。
+  4. 回调 `Watching._invalidate(fileTimeInfoEntries, contextTimeInfoEntries, changes, removals)`。
+
+#### 9.1.2 Watching 聚合与状态机
+
+[Watching._invalidate](file:///e:/newGsb/questions/GSB-013/Steve/lib/Watching.js#L420-L442) 是所有失效的入口（包括 watcher 回调、`watching.invalidate()` 手动调用、`suspend()/resume()`）：
+
+```js
+_invalidate(fileTimeInfoEntries, contextTimeInfoEntries, changedFiles, removedFiles) {
+    if (this.suspended || (this._isBlocked() && (this.blocked = true))) {
+        this._mergeWithCollected(changedFiles, removedFiles);
+        return;
+    }
+    if (this.running) {
+        this._mergeWithCollected(changedFiles, removedFiles);
+        this.invalid = true;
+    } else {
+        this._go(fileTimeInfoEntries, contextTimeInfoEntries, changedFiles, removedFiles);
+    }
+}
+```
+
+三种状态：
+
+1. **suspended 或 blocked**：变化被 `_mergeWithCollected` 合并到 `_collectedChangedFiles`/`_collectedRemovedFiles` Set 中，等待 resume/unblock 后处理。
+2. **正在编译（running=true）**：变化同样被合并，设置 `this.invalid = true`。当前编译继续进行，但 [_done](file:///e:/newGsb/questions/GSB-013/Steve/lib/Watching.js#L281-L301) 会检测到 `this.invalid`，在 emit 完成后**不建立 watcher**，而是 `storeBuildDependencies` 后直接再次 `_go()`，丢弃当前 compilation 的结果（如果 emit 还没开始，onCompiled 里 [#L190](file:///e:/newGsb/questions/GSB-013/Steve/lib/Watching.js#L190) `if (this.invalid) return this._done(null, compilation)` 提前结束）。这就是"构建过程中再次 invalid"的处理——不中断当前构建，但完成后立即启动新一轮。
+3. **空闲（running=false）**：直接调用 `_go` 开始新编译。
+
+[_mergeWithCollected](file:///e:/newGsb/questions/GSB-013/Steve/lib/Watching.js#L83-L100) 把新的变化合入已收集集合，并从 changed 中移除已 deleted 的路径（反之亦然），保证最终集合反映最新状态。
+
+#### 9.1.3 _go：准备编译上下文
+
+[Watching._go](file:///e:/newGsb/questions/GSB-013/Steve/lib/Watching.js#L109-L239)：
+
+1. 设置 `this.running = true`。
+2. 如果有上一个 watcher，`this.watcher.pause()` 并保存为 `pausedWatcher`；从 `pausedWatcher.getInfo()` 取出 `changes/removals/fileTimeInfoEntries/contextTimeInfoEntries`，与新传入的合并。
+3. 设置 `compiler.fsStartTime = Date.now()`。
+4. 设置 `compiler.modifiedFiles`、`compiler.removedFiles`、`compiler.fileTimestamps`、`compiler.contextTimestamps`。这些字段在 [Compilation 构造函数](file:///e:/newGsb/questions/GSB-013/Steve/lib/Compilation.js#L1014-L1022) 中被传入 `fileSystemInfo.addFileTimestamps/addContextTimestamps`。
+5. 若 `this.idle`，先 `compiler.cache.endIdle(cb)`（filesystem cache 可能正在落盘，endIdle 等待其完成），然后再次 `run()`。
+6. 首次（`_needRecords`）读取 records。
+7. 触发 `compiler.hooks.watchRun.callAsync(this.compiler, ...)`。
+8. 调用 `this.compiler.compile(onCompiled)`——进入与非 watch 模式相同的 compile 链路（newCompilationParams → newCompilation → make → finish → seal）。
+
+关键区别：watch 模式不触发 `beforeRun`/`run`，而是 `watchRun`；不每次读取 records；compile 链路本身完全相同。
+
+### 9.2 FileSystemInfo snapshot：模块级复用的事实依据
+
+#### 9.2.1 snapshot 的创建
+
+每个 NormalModule 构建成功后（[NormalModule.js#L1314-L1332](file:///e:/newGsb/questions/GSB-013/Steve/lib/NormalModule.js#L1314-L1332)），收集：
+
+- `fileDependencies`：源码文件本身 + loader 读取/生成的文件（通过 `this.buildInfo.fileDependencies`）。
+- `contextDependencies`：loader 登记的目录依赖。
+- `missingDependencies`：解析时确认不存在的文件（缺失依赖）。
+
+然后调用 `compilation.fileSystemInfo.createSnapshot(startTime, fileDependencies, contextDependencies, missingDependencies, snapshotOptions, cb)`，把结果存入 `buildInfo.snapshot`，并清空原始的三个依赖集合（它们被 snapshot 取代）。
+
+[FileSystemInfo.createSnapshot](file:///e:/newGsb/questions/GSB-013/Steve/lib/FileSystemInfo.js#L2170) 根据 `options.hash`/`options.timestamp` 决定模式（[#L2203](file:///e:/newGsb/questions/GSB-013/Steve/lib/FileSystemInfo.js#L2203)）：
+
+- `mode=1`（timestamp，默认）：对每个文件 stat 获取 `timestamp`/`safeTime`，对目录获取 `timestampHash`，对 missing 项记录存在性。
+- `mode=2`（hash）：读取文件内容计算 hash。
+- `mode=3`（timestamp+hash）：两者都记录。
+
+每个路径先经过 `checkManaged`（[#L2265-L2306](file:///e:/newGsb/questions/GSB-013/Steve/lib/FileSystemInfo.js#L2265-L2306)）：命中 `immutablePaths`（如 `[contenthash]` 文件名）的路径被标记为 immutable，snapshot 中不记录其时间戳（永远视为有效）；命中 `managedPaths`（如 `node_modules`）的路径由 managed item 优化器压缩表示。最终生成 [Snapshot](file:///e:/newGsb/questions/GSB-013/Steve/lib/FileSystemInfo.js#L271) 对象，内含 `fileTimestamps`、`fileHashes`、`fileTshs`、`contextTimestamps`、`missingExistence`、`managedFiles`、`children`（子 snapshot）等。
+
+#### 9.2.2 snapshot 的验证
+
+[NormalModule.needBuild](file:///e:/newGsb/questions/GSB-013/Steve/lib/NormalModule.js#L1540-L1592) 在 `_buildModule` 中被调用，按以下顺序判断：
+
+1. `this._forceBuild` 为 true → 重建（新建模块、`invalidateBuild()` 后设置）。
+2. `this.error` 存在 → 重建（上次构建出错总是重试）。
+3. `!buildInfo.cacheable` → 重建。
+4. `!buildInfo.snapshot` → 重建。
+5. `valueDependencies` 变化 → 重建。`valueDependencies` 是 loader 通过 `this._module.buildInfo.valueDependencies` 登记的键值对（如自定义环境变量），与 `compilation.valueCacheVersions` 比较。
+6. 调用 `fileSystemInfo.checkSnapshotValid(snapshot, cb)`。
+
+[FileSystemInfo.checkSnapshotValid](file:///e:/newGsb/questions/GSB-013/Steve/lib/FileSystemInfo.js#L2729-L2742) 先查 `_snapshotCache`（WeakMap<Snapshot, boolean|callback[]>），同一 Compilation 内重复验证的 snapshot 直接复用结果；未缓存则调用 [_checkSnapshotValidNoCache](file:///e:/newGsb/questions/GSB-013/Steve/lib/FileSystemInfo.js#L2750)。
+
+验证逻辑：
+
+- 对 snapshot 中的每个文件，取当前 `FileSystemInfo._fileTimestamps`（由 `addFileTimestamps` 从 compiler.fileTimestamps 填充）中的 `FileSystemInfoEntry`，与 snapshot 记录的 timestamp 比较（[checkFile](file:///e:/newGsb/questions/GSB-013/Steve/lib/FileSystemInfo.js#L2824-L2858)）：
+  - 存在性变化（文件被删/新建）→ invalid。
+  - `safeTime > startTime` → invalid（文件在 snapshot 创建后可能又被修改）。
+  - `timestamp` 不同 → invalid。
+- 对目录用 `timestampHash` 比较（[checkContext](file:///e:/newGsb/questions/GSB-013/Steve/lib/FileSystemInfo.js#L2866-L2903)），目录内文件增删会改变 timestampHash。
+- 对 missing 项检查存在性变化（文件从不存在变为存在，或反之）→ invalid。
+- 若有 children（snapshot 合并产生），递归验证所有子 snapshot。
+- 全部通过 → valid。
+
+snapshot valid 后，还会触发 `NormalModule.getCompilationHooks(compilation).needBuild.callAsync`（[#L1579-L1590](file:///e:/newGsb/questions/GSB-013/Steve/lib/NormalModule.js#L1579-L1590)），插件可以强制重建。
+
+**关键**：snapshot valid 意味着该模块不需要重新运行 loader 和 parser，模块的 `dependencies`/`blocks`/`buildMeta`/`buildInfo`（除 snapshot 外）保持上一轮的值。这是"复用旧结果"的最核心边界。
+
+### 9.3 四类依赖与 build dependencies
+
+Compilation 维护四个 LazySet（[Compilation.js#L1183-L1189](file:///e:/newGsb/questions/GSB-013/Steve/lib/Compilation.js#L1183-L1189)）：
+
+| 依赖类型 | 来源 | 验证时机 | 失效影响 |
+|---------|------|---------|---------|
+| `fileDependencies` | 模块源码 + loader 读取的文件；asset 资源文件 | 每轮编译时模块 `needBuild` 的 snapshot 检查 | 单个模块重建 |
+| `contextDependencies` | loader 登记的目录（如 `require.context`）；watchpack 监视目录内容变化 | 每轮编译时 snapshot 的 `contextTimestamps`/`timestampHash` 检查 | 引用该 context 的模块重建，可能发现新文件 |
+| `missingDependencies` | 解析时确认不存在的文件（如可选依赖的查找路径） | 每轮编译时 snapshot 的 `missingExistence` 检查 | 文件出现时相关模块重建 |
+| `buildDependencies` | loader、配置文件、webpack 自身、插件等影响构建行为的全局依赖 | **不是**每轮模块 snapshot 检查；由 filesystem cache 在启动时验证 | 整个缓存失效，全量重建 |
+
+`fileDependencies`/`contextDependencies`/`missingDependencies` 在 seal 末尾由 [summarizeDependencies](file:///e:/newGsb/questions/GSB-013/Steve/lib/Compilation.js#L4203) 汇总，`Watching.watch` 用它们建立下一轮 watcher。模块的 `addCacheDependencies`（[NormalModule.js#L1621-L1646](file:///e:/newGsb/questions/GSB-013/Steve/lib/NormalModule.js#L1621-L1646)）在 Compilation 收集依赖时从 snapshot 还原这三类路径。
+
+`buildDependencies` 不同：它不进入模块 snapshot，而是通过 `compilation.buildDependencies` 收集，最终由 [Cache.storeBuildDependencies](file:///e:/newGsb/questions/GSB-013/Steve/lib/Cache.js#L61) hook 传给 cache 策略。loader 通过 `this._compilation.buildDependencies.add(path)` 登记（例如 babel-loader 登记配置文件和 babel 自身版本标识）。
+
+### 9.4 CacheFacade 与三层编译期缓存
+
+Compilation 构造时创建三个命名缓存 facade（[Compilation.js#L1203-L1205](file:///e:/newGsb/questions/GSB-013/Steve/lib/Compilation.js#L1203-L1205)）：
+
+```js
+this._modulesCache = this.getCache("Compilation/modules");
+this._assetsCache = this.getCache("Compilation/assets");
+this._codeGenerationCache = this.getCache("Compilation/codeGeneration");
+```
+
+[Compiler.getCache](file:///e:/newGsb/questions/GSB-013/Steve/lib/Compiler.js#L331-L337) 返回以 `${compilerPath}${name}` 为命名空间的 [CacheFacade](file:///e:/newGsb/questions/GSB-013/Steve/lib/CacheFacade.js#L196)。缓存的存取通过 `cache.get(identifier, etag, callback)` / `cache.store(identifier, etag, data, callback)` 委托给 `compiler.cache`（[Cache](file:///e:/newGsb/questions/GSB-013/Steve/lib/Cache.js#L53) hook 系统），具体由 MemoryCachePlugin 或 PackFileCacheStrategy 响应。
+
+**identifier** 是缓存项的唯一键（字符串），**etag** 是版本/内容指纹。只有 identifier 和 etag 都匹配时缓存才命中。
+
+#### 9.4.1 模块缓存 `_modulesCache`
+
+- **get**：在 [_addModule](file:///e:/newGsb/questions/GSB-013/Steve/lib/Compilation.js#L1433) 中，按 `module.identifier()` 取，etag 传 `null`（[#L1433](file:///e:/newGsb/questions/GSB-013/Steve/lib/Compilation.js#L1433)）。命中时调用 `cacheModule.updateCacheModule(module)`，复用缓存的 Module 实例（含其 buildInfo、dependencies 等），替代新 factory 创建的 module。
+- **store**：在 [_buildModule](file:///e:/newGsb/questions/GSB-013/Steve/lib/Compilation.js#L1536) 中，模块构建成功后按 identifier 存，etag 为 `null`。
+
+注意模块缓存的 etag 为 `null`，意味着**它不依赖内容指纹**，而是依赖外层的 `needBuild` 检查——只有 snapshot valid 时才会走缓存路径（factory.create 返回的新 module 会被缓存 module 替换）。如果模块需要重建，factory 创建的 module 直接使用，不查缓存（或缓存命中但 `needBuild` 返回 true 后仍会重新 build）。
+
+#### 9.4.2 code generation 缓存 `_codeGenerationCache`
+
+在 [_codeGenerationModule](file:///e:/newGsb/questions/GSB-013/Steve/lib/Compilation.js#L3636-L3642) 中：
+
+```js
+const cache = new MultiItemCache(
+    runtimes.map(runtime =>
+        this._codeGenerationCache.getItemCache(
+            `${module.identifier()}|${getRuntimeKey(runtime)}`,
+            `${hash}|${dependencyTemplates.getHash()}`
+        )
+    )
+);
+```
+
+- **identifier**：`module.identifier()|runtime`（每个 runtime 独立缓存）。
+- **etag**：`${moduleHash}|${dependencyTemplates.getHash()}`。moduleHash 是 [createModuleHashes](file:///e:/newGsb/questions/GSB-013/Steve/lib/Compilation.js) 阶段基于 `module.updateHash` 计算的，涵盖 `buildInfo.hash`、generator 的 hash、presentational dependencies 的 hash。dependencyTemplates hash 涵盖所有 DependencyTemplate 的版本。
+
+因此：模块源码变化（buildInfo.hash 变）→ moduleHash 变 → codegen 缓存未命中，重新生成；仅 chunk 组成变化但模块本身不变 → moduleHash 不变 → codegen 结果可复用。MultiItemCache 对多个 runtime 取交集——只有所有 runtime 都有缓存时才整体命中。
+
+#### 9.4.3 资产缓存 `_assetsCache`
+
+在 [createChunkAssets](file:///e:/newGsb/questions/GSB-013/Steve/lib/Compilation.js#L4951-L4954) 中：
+
+```js
+const assetCacheItem = this._assetsCache.getItemCache(ident, usedHash);
+```
+
+- **identifier**：`fileManifest.identifier`（由各模块类型插件在 renderManifest 中提供，如 `chunk${chunk.id}` 或 `hotupdatechunk${chunk.id}`，见 [JavascriptModulesPlugin.js#L394-L396](file:///e:/newGsb/questions/GSB-013/Steve/lib/javascript/JavascriptModulesPlugin.js#L394-L396)）。
+- **etag**：`fileManifest.hash`，即 chunk 的 `contentHash`（如 `chunk.contentHash.javascript`），在 createHash 阶段计算，涵盖 chunk 内所有模块的 code generation 结果 hash 和 runtime modules hash。
+
+因此：chunk 内容不变 → contentHash 不变 → 渲染好的 Source 直接从缓存取，不重新 render；chunk 内容变 → contentHash 变 → 重新调用 `fileManifest.render()`。
+
+资产缓存复用的是**渲染后的 Source 对象**，但 `emitAsset` 仍会把它放入 `compilation.assets`。是否写出到磁盘由 Compiler.emitAssets 的增量逻辑决定。
+
+### 9.5 PackFileCacheStrategy：filesystem cache 的全局门控
+
+filesystem cache 由 [IdleFileCachePlugin](file:///e:/newGsb/questions/GSB-013/Steve/lib/cache/IdleFileCachePlugin.js) 包装 [PackFileCacheStrategy](file:///e:/newGsb/questions/GSB-013/Steve/lib/cache/PackFileCacheStrategy.js#L1064)，在 `compiler.cache.hooks` 上 tap `get`/`store`/`storeBuildDependencies`/`beginIdle`/`endIdle`/`shutdown`。
+
+#### 9.5.1 启动时恢复与 build dependencies 验证
+
+构造函数中 `this.packPromise = this._openPack()`（[#L1134](file:///e:/newGsb/questions/GSB-013/Steve/lib/cache/PackFileCacheStrategy.js#L1134)）。[_openPack](file:///e:/newGsb/questions/GSB-013/Steve/lib/cache/PackFileCacheStrategy.js#L1151-L1309)：
+
+1. 反序列化 `${cacheLocation}/index.pack` 得到 [PackContainer](file:///e:/newGsb/questions/GSB-013/Steve/lib/cache/PackFileCacheStrategy.js)（含 version、buildSnapshot、buildDependencies、resolveResults、resolveBuildDependenciesSnapshot、data）。
+2. 检查 `version`（配置的 `cache.version`），不匹配则丢弃整个缓存。
+3. **验证 buildSnapshot**（[#L1206-L1225](file:///e:/newGsb/questions/GSB-013/Steve/lib/cache/PackFileCacheStrategy.js#L1206-L1225)）：`fileSystemInfo.checkSnapshotValid(packContainer.buildSnapshot)`。buildSnapshot 是上一轮结束时对所有 build dependencies 解析后的文件创建的 snapshot。如果 webpack 配置文件、loader 文件、node_modules 中的包等发生变化，snapshot invalid → **整个 pack 被丢弃，全量重建**。
+4. **验证 resolveBuildDependenciesSnapshot**（[#L1228-L1270](file:///e:/newGsb/questions/GSB-013/Steve/lib/cache/PackFileCacheStrategy.js#L1228-L1270)）：这是对 build dependencies "解析结果"的 snapshot（如 loader 的解析路径）。invalid 时进一步调用 `checkResolveResultsValid` 检查 resolveResults（路径到解析结果的映射），若仍有效则保留 buildDependencies 但标记需重新解析；若解析结果也变了则丢弃。
+5. 两者都 valid 时，恢复 pack 的 data（所有缓存项），否则返回空 Pack。
+
+这就是"配置/loader 变了却复用旧结果"问题的防线——build dependencies 变化会让整个 filesystem cache 失效。反之，如果 build dependencies 没变但模块 snapshot 检查通过，模块/codegen/asset 都可以从 pack 恢复。
+
+#### 9.5.2 运行时存取
+
+- [store(identifier, etag, data)](file:///e:/newGsb/questions/GSB-013/Steve/lib/cache/PackFileCacheStrategy.js#L1317-L1323)：`pack.set(identifier, etag.toString(), data)`，写入内存中的 Pack。
+- [restore(identifier, etag)](file:///e:/newGsb/questions/GSB-013/Steve/lib/cache/PackFileCacheStrategy.js#L1330-L1343)：`pack.get(identifier, etag.toString())`。pack 内部按 identifier 索引，etag 不匹配返回 undefined。
+- etag 为 `null` 时存为 `null`，匹配时只看 identifier。
+
+#### 9.5.3 空闲落盘
+
+[IdleFileCachePlugin](file:///e:/newGsb/questions/GSB-013/Steve/lib/cache/IdleFileCachePlugin.js#L178-L218) tap `cache.hooks.beginIdle`（在 `_done` 中 `cache.beginIdle()` 触发），启动 idle timer。timer 触发后：
+
+1. 调用 `strategy.afterAllStored()`（[#L1353](file:///e:/newGsb/questions/GSB-013/Steve/lib/cache/PackFileCacheStrategy.js#L1353)）。
+2. 如果有新的 buildDependencies，调用 `fileSystemInfo.resolveBuildDependencies` 解析它们，再为解析结果和文件本身分别 createSnapshot，merge 到 `buildSnapshot`/`resolveBuildDependenciesSnapshot`。
+3. 构造 PackContainer（含 pack、version、buildSnapshot、buildDependencies、resolveResults、resolveBuildDependenciesSnapshot）。
+4. 序列化写入 `index.pack`（支持 gzip/brotli 压缩）。
+
+`endIdle`（下一轮编译开始时 `cache.endIdle()`）清除 idle timer。`shutdown`（compiler.close）等待落盘完成。
+
+### 9.6 写出资产（runtime 域）的增量边界
+
+seal 完成后，[Compiler.emitAssets](file:///e:/newGsb/questions/GSB-013/Steve/lib/Compiler.js#L676-L1021) 不依赖 Compilation 的 codegen/asset 缓存（那些在 seal 内已完成），而是有自己的增量写出机制：
+
+- `_assetEmittingSourceCache`（WeakMap<Source, CacheEntry>，[Compiler.js#L131](file:///e:/newGsb/questions/GSB-013/Steve/lib/Compiler.js#L131)）：缓存每个 Source 的写出信息。
+- `_assetEmittingWrittenFiles`（Map<path, generation>，[Compiler.js#L135](file:///e:/newGsb/questions/GSB-013/Steve/lib/Compiler.js#L135)）：记录已写文件及其 generation。
+- `compareBeforeEmit` 为 true（默认）时：先 `stat` 目标文件，若存在且 size 相同则 `readFile` 比较内容，`Buffer.equals` 相同则跳过 writeFile（[#L976-L999](file:///e:/newGsb/questions/GSB-013/Steve/lib/Compiler.js#L976-L999) 附近逻辑）。这避免了内容未变时不必要的文件写入（保持 mtime，减少下游工具的被动 rebuild）。
+- immutable 资源（含 hash 的 asset info）已存在时直接跳过。
+- 大小写冲突检测防止两个 asset 写到同一不区分大小写路径。
+
+注意：即使 Compilation 的 assets 完全来自 `_assetsCache`（渲染结果被复用），`emitAssets` 仍会遍历所有 assets 并执行 stat/compare 逻辑。资产缓存复用的是"渲染计算"，而 compareBeforeEmit 复用的是"磁盘写入"。
+
+### 9.7 失效传播边界总结
+
+一次变化在各层的传播路径：
+
+```
+watcher 检测到文件变化
+  → watchpack aggregateTimeout 聚合
+  → CachedInputFileSystem.purge(变化路径)        [resolver 缓存失效]
+  → Watching._invalidate
+    → (若 running) this.invalid=true，合并变化
+    → (若 idle) _go
+      → compiler.fileTimestamps/contextTimestamps 更新   [时间戳事实更新]
+      → compiler.modifiedFiles/removedFiles 更新
+      → FileSystemInfo.addFileTimestamps/addContextTimestamps
+      → watchRun hook
+      → compiler.compile
+        → new Compilation（新 ModuleGraph/ChunkGraph）
+        → make: 每个模块 needBuild
+          → snapshot valid?
+            是 → 从 _modulesCache 恢复 Module 实例，跳过 loader/parse
+            否 → factory.create + _buildModule（loader+parse），store 回 _modulesCache
+        → finish/seal:
+          → codeGeneration: etag = moduleHash|depTemplatesHash
+            匹配 → 从 _codeGenerationCache 复用 CodeGenerationResult
+            不匹配 → module.codeGeneration()，store
+          → createChunkAssets: etag = chunk.contentHash
+            匹配 → 从 _assetsCache 复用 Source
+            不匹配 → renderManifest.render()，store
+        → emitAssets:
+          → compareBeforeEmit stat+read 比较
+            相同 → 跳过 writeFile
+            不同 → writeFile
+```
+
+三层缓存的失效条件：
+
+| 缓存层 | identifier | etag | 失效条件 | 复用的内容 |
+|--------|-----------|------|---------|-----------|
+| `_modulesCache` | `module.identifier()` | `null` | 模块 snapshot invalid（文件/目录/missing/valueDeps 变化）或 `_forceBuild`/error/non-cacheable | 整个 Module 对象（buildMeta、dependencies、blocks、buildInfo） |
+| `_codeGenerationCache` | `identifier\|runtime` | `moduleHash\|depTemplatesHash` | 模块 updateHash 变化（源码、generator、presentational deps）或 DependencyTemplate 变化 | CodeGenerationResult（sources Map、runtimeRequirements） |
+| `_assetsCache` | `renderManifest.identifier` | `chunk.contentHash` | chunk 内容变化（模块增删、runtime requirements 变化、模块 hash 变化导致 contentHash 变） | 渲染后的 Source 对象 |
+
+filesystem cache 的全局门控：
+
+| 门控 | 检查内容 | 失效后果 |
+|------|---------|---------|
+| `cache.version` | 配置的版本字符串 | 整个 pack 丢弃 |
+| `buildSnapshot` | build dependencies 解析后的文件 snapshot | 整个 pack 丢弃 |
+| `resolveBuildDependenciesSnapshot` + `resolveResults` | build dependencies 的解析路径 | 重新解析，必要时丢弃 |
+| 各缓存项 etag | identifier + etag 双匹配 | 单项未命中，重新计算 |
+
+### 9.8 判定表：各类变化的复用与重建
+
+下表针对 watch 模式下的典型变化，标注每一层是否复用。
+
+| 变化类型 | 模块 build（loader/parse） | ModuleGraph/ChunkGraph 重建 | code generation | chunk asset 渲染 | 磁盘 writeFile | filesystem pack |
+|---------|--------------------------|---------------------------|-----------------|-----------------|---------------|-----------------|
+| **普通源码文件内容变化**（如 `shared.js` 改了一行） | 该模块 snapshot invalid → 重建；依赖它的模块 snapshot 不 invalid（依赖的是模块标识符不是内容）→ 不重建 | 是（新 Compilation 重建图，但结构通常不变） | 该模块 moduleHash 变 → 重新 codegen；其他模块 etag 不变 → 复用 | 含该模块的 chunk contentHash 变 → 重新 render；不含的 chunk 复用 | 内容变的 asset 写入；未变的 compareBeforeEmit 跳过 | 保留，仅更新对应缓存项 |
+| **loader 额外登记的依赖变化**（loader 通过 `addDependency` 登记的文件、`require.context` 目录内容变化） | 该模块 snapshot 中包含这些路径 → invalid → 重建；context 依赖 timestampHash 变 → 重建 | 是；context 目录新增文件可能产生新模块 | 受影响模块重新 codegen | 相关 chunk 重新 render | 变更的 asset 写入 | 保留 |
+| **缺失依赖出现**（missingDependency 对应的文件被创建） | 相关模块 snapshot 的 missingExistence 变化 → invalid → 重建；resolver 的 CachedInputFileSystem 已被 purge，重新解析会找到新文件 | 是；可能引入新模块/依赖边 | 受影响模块重新 codegen | 相关 chunk 重新 render | 变更的 asset 写入 | 保留 |
+| **构建依赖或配置变化**（loader 文件改、babel 配置改、webpack.config 改、`cache.version` 变） | buildSnapshot invalid → **整个 pack 丢弃**；所有模块 `_modulesCache` 未命中 → 全部重建（但模块的 snapshot 仍可能 valid 而从内存缓存恢复，取决于内存缓存是否还在） | 是，全量 | 全部 codegen（codegen cache 随 pack 丢失） | 全部 render | 视 compareBeforeEmit 结果，内容未变的跳过 | **丢弃并重建** |
+| **构建过程中再次 invalid**（编译进行中又有文件变化） | 当前编译不中断，继续完成；`this.invalid=true` 使 `_done` 完成后立即启动新一轮 | 当前轮结果被丢弃（不写 watcher、不交付给用户）；下一轮全新 Compilation | 当前轮照常计算但结果不持久化到下一轮 | 同左 | 当前轮若已 emit 可能写入磁盘，但下一轮会覆盖；若在 emit 前 invalid 则跳过 emit | 当前轮的 store 可能被下一轮覆盖；filesystem cache 在下一轮 endIdle 时落盘最新 |
+| **异步块内的模块变化**（7.1 场景中 `async.js` 改了） | async 模块重建；entry-a 模块 snapshot 不 invalid（entry-a 不直接依赖 async.js 文件，只依赖 ImportDependency 记录的 request） | 是；但 chunk 结构不变 | async 模块 codegen；entry-a 的 codegen etag 不变（其 codegen 不依赖 async 模块内容，只依赖 blockPromise 生成的 chunkId）→ 复用 | async chunk contentHash 变 → 重新 render；entry chunk contentHash 通常不变（chunk 内模块未变）→ 复用 | async chunk 文件写入；entry chunk compareBeforeEmit 跳过 | 保留 |
+| **仅 chunk 组合/配置变化**（splitChunks 配置改、runtimeChunk 改，但源码未变） | 所有模块 snapshot valid → 全部从 `_modulesCache` 复用，零 loader/parse | 是，重新分配 chunk | 模块 codegen etag 基于 moduleHash（不含 chunk 分配）→ 大部分复用；但 runtime 变化可能导致 runtime module codegen 变 | 几乎所有 chunk contentHash 变（chunk 组成变了）→ 重新 render | 大量 asset 写入 | 保留（模块/codegen 缓存仍命中） |
+| **文件 touch（mtime 变但内容不变）** | timestamp 不同 → snapshot invalid → 重建（这是 timestamp 模式的已知局限；hash 模式可避免） | 是 | moduleHash 可能不变（buildInfo.hash 基于内容）→ codegen 复用 | contentHash 不变 → 渲染复用 | compareBeforeEmit 内容相同 → 跳过 | 保留，但模块缓存项被新 module 实例覆盖 |
+
+补充说明：
+
+- "loader 额外登记的依赖"指 loader 在执行过程中通过 `this.addDependency`/`this.addContextDependency`/`this.addMissingDependency` 加入 NormalModule 构建信息的路径，这些路径被纳入模块 snapshot。
+- "构建依赖"由 loader 通过 `this._compilation.buildDependencies.add()` 或插件通过 `compiler.cache.hooks.storeBuildDependencies` 登记，独立于模块 snapshot。
+- watch 模式下 `_modulesCache`/`_codeGenerationCache`/`_assetsCache` 的内存缓存在 Compilation 之间不共享（每次 `new Compilation` 创建新的 CacheFacade），但底层 `compiler.cache` 的 MemoryCachePlugin/PackFileCacheStrategy 跨 Compilation 持久化。filesystem cache 命中时，模块实例从 pack 反序列化恢复。
+- `fileDependencies` 中文件被 purge（resolver 缓存清理）发生在 watchpack aggregated 回调中，这保证 resolver 不会返回旧的解析结果。
+- timestamp 模式下，文件 mtime 变化即触发重建，即使内容相同。使用 `snapshot.hash: true`（或 `experiments.futureDefaults`）可切换到基于内容 hash 的判断，减少不必要的重建（未证实：具体默认值在 5.99.9 中是否已改为 hash，需核对 `applySnapshotDefaults`）。
+
+### 9.9 关键源码依据索引
+
+- Watching invalidation 状态机：[Watching.js#L420-L442](file:///e:/newGsb/questions/GSB-013/Steve/lib/Watching.js#L420-L442)
+- Watching _go 编译准备：[Watching.js#L109-L239](file:///e:/newGsb/questions/GSB-013/Steve/lib/Watching.js#L109-L239)
+- Watching watch 建立与回调：[Watching.js#L354-L395](file:///e:/newGsb/questions/GSB-013/Steve/lib/Watching.js#L354-L395)
+- 构建中 invalid 短路：[Watching.js#L190](file:///e:/newGsb/questions/GSB-013/Steve/lib/Watching.js#L190)、[Watching.js#L281-L301](file:///e:/newGsb/questions/GSB-013/Steve/lib/Watching.js#L281-L301)
+- NodeWatchFileSystem：[NodeWatchFileSystem.js#L30-L189](file:///e:/newGsb/questions/GSB-013/Steve/lib/node/NodeWatchFileSystem.js#L30-L189)
+- Compilation 缓存 facade 创建：[Compilation.js#L1203-L1205](file:///e:/newGsb/questions/GSB-013/Steve/lib/Compilation.js#L1203-L1205)
+- NormalModule.needBuild：[NormalModule.js#L1540-L1592](file:///e:/newGsb/questions/GSB-013/Steve/lib/NormalModule.js#L1540-L1592)
+- NormalModule snapshot 创建：[NormalModule.js#L1314-L1332](file:///e:/newGsb/questions/GSB-013/Steve/lib/NormalModule.js#L1314-L1332)
+- FileSystemInfo.createSnapshot：[FileSystemInfo.js#L2170-L2252](file:///e:/newGsb/questions/GSB-013/Steve/lib/FileSystemInfo.js#L2170-L2252)
+- FileSystemInfo.checkSnapshotValid：[FileSystemInfo.js#L2729-L2742](file:///e:/newGsb/questions/GSB-013/Steve/lib/FileSystemInfo.js#L2729-L2742)
+- FileSystemInfo snapshot 文件/目录/missing 检查：[FileSystemInfo.js#L2824-L2903](file:///e:/newGsb/questions/GSB-013/Steve/lib/FileSystemInfo.js#L2824-L2903)
+- 模块缓存 get/store：[Compilation.js#L1433](file:///e:/newGsb/questions/GSB-013/Steve/lib/Compilation.js#L1433)、[Compilation.js#L1536](file:///e:/newGsb/questions/GSB-013/Steve/lib/Compilation.js#L1536)
+- codegen 缓存 etag：[Compilation.js#L3636-L3642](file:///e:/newGsb/questions/GSB-013/Steve/lib/Compilation.js#L3636-L3642)
+- asset 缓存 etag：[Compilation.js#L4951-L4954](file:///e:/newGsb/questions/GSB-013/Steve/lib/Compilation.js#L4951-L4954)
+- CacheFacade：[CacheFacade.js#L196-L346](file:///e:/newGsb/questions/GSB-013/Steve/lib/CacheFacade.js#L196-L346)
+- getLazyHashedEtag：[getLazyHashedEtag.js#L19-L80](file:///e:/newGsb/questions/GSB-013/Steve/lib/cache/getLazyHashedEtag.js#L19-L80)
+- PackFileCacheStrategy 启动恢复与 build deps 验证：[PackFileCacheStrategy.js#L1151-L1309](file:///e:/newGsb/questions/GSB-013/Steve/lib/cache/PackFileCacheStrategy.js#L1151-L1309)
+- PackFileCacheStrategy store/restore：[PackFileCacheStrategy.js#L1317-L1343](file:///e:/newGsb/questions/GSB-013/Steve/lib/cache/PackFileCacheStrategy.js#L1317-L1343)
+- PackFileCacheStrategy 落盘与 buildSnapshot 创建：[PackFileCacheStrategy.js#L1353-L1534](file:///e:/newGsb/questions/GSB-013/Steve/lib/cache/PackFileCacheStrategy.js#L1353-L1534)
+- IdleFileCachePlugin idle 定时器：[IdleFileCachePlugin.js#L178-L235](file:///e:/newGsb/questions/GSB-013/Steve/lib/cache/IdleFileCachePlugin.js#L178-L235)
+- Compiler.emitAssets 增量写出：[Compiler.js#L676-L1021](file:///e:/newGsb/questions/GSB-013/Steve/lib/Compiler.js#L676-L1021)
+- 四类依赖集合：[Compilation.js#L1183-L1189](file:///e:/newGsb/questions/GSB-013/Steve/lib/Compilation.js#L1183-L1189)
+- NormalModule.addCacheDependencies：[NormalModule.js#L1621-L1646](file:///e:/newGsb/questions/GSB-013/Steve/lib/NormalModule.js#L1621-L1646)
+
+---
+
+## 10. 待深入与未证实项
 
 - MultiCompiler 的并发/依赖调度未逐行阅读。
 - `Compilation.unseal()` 后重 seal 是否新建 ChunkGraph：源码显示 seal 开头无条件 `new ChunkGraph`，但 unseal 未把 `this.chunkGraph` 置空，第二次 seal 会覆盖旧引用；旧 ChunkGraph 的 WeakMap 条目是否被显式清理未证实。
@@ -753,3 +1093,8 @@ __webpack_require__.f.j = function(chunkId, promises) {
 - 异步 chunk 文件的 JSONP wrapper（`window["webpackChunk"].push(...)`）由哪个 template/runtime module 生成未在本次展开（应在 JavascriptModulesPlugin 的 renderChunk 或 JsonpTemplatePlugin 中）。
 - splitChunks/runtimeChunk 如何改变 7.4 节描述的默认 chunk 分配（共享模块抽取到独立 chunk、runtime 抽取到独立 chunk）未在本次追踪，因为场景设定为默认配置。
 - 多入口共享模块在默认配置下被复制到每个入口 chunk 的结论基于 buildChunkGraph 的 minAvailableModules 按 chunkGroup 独立计算逻辑推断，未用实际构建产物验证。
+- `snapshot.options.hash` 在 webpack 5.99.9 中的默认值（timestamp vs hash vs timestamp+hash）未逐行核对 `applySnapshotDefaults`；9.8 节"文件 touch"场景在 hash 模式下的行为需验证。
+- watch 模式下 filesystem cache 的内存层（MemoryCachePlugin）与磁盘层（PackFileCacheStrategy）的优先级和交互顺序未逐行核对；9.8 节中"build deps 变化时模块可能从内存缓存恢复"的表述需验证。
+- `compiler.modifiedFiles`/`removedFiles` 在核心编译链路中的消费点未找到（除传递给 child compiler 外），核心失效主要通过 fileTimestamps/contextTimestamps 驱动；这两个 Set 是否被 NormalModuleFactory 或其他内置组件使用未证实。
+- `compareBeforeEmit` 为 true 时 stat+readFile 比较的精确代码位置在 9.6 节中标注为"附近逻辑"，未逐行确认行号。
+- "依赖 shared 的模块 snapshot 不因 shared 内容变化而 invalid"的结论基于 snapshot 只记录文件路径和时间戳、不记录依赖模块内容这一事实，但需确认 loader 是否会通过 valueDependencies 间接关联。
